@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ampere"
+version = "0.1.0"
+authors = [
+  { name="Adam McDaniel", email="adam.mcdaniel17@email.com" },
+]
+description = "Tool for analysis of OTF2 traces and energy attribution."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    # "thicket",
+    # "hatchet",
+    "otf2",
+    "matplotlib",
+    "pandas",
+    "seaborn",
+    "numpy==1.26.4",
+    "tqdm"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/adam-mcdaniel/ampere"
