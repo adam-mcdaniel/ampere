@@ -23,7 +23,7 @@ dependencies = [
     "matplotlib",
     "pandas",
     "seaborn",
-    "numpy==1.26.4",
+    "numpy",
     "tqdm"
 ]
 
