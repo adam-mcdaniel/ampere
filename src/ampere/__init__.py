@@ -7,8 +7,9 @@ from typing import Dict, List, Tuple, Optional, Union, Any, Literal, Callable, P
 from collections import defaultdict
 from tqdm import tqdm
 from dataclasses import dataclass
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+from .session import AmpereSession, connect
 
 # ==========================================
 # 1. Configuration & Types
@@ -88,6 +89,11 @@ class Metric:
         else:
             self.cum_values = self.raw_values
 
+    @property
+    def values(self) -> ak.pdarray:
+        """Alias for raw_values to support legacy/external access."""
+        return self.raw_values
+
     def get_delta_vectorized(self, t_starts: ak.pdarray, t_ends: ak.pdarray) -> ak.pdarray:
         t_s = ak.where(t_starts < self.t_min, self.t_min, t_starts)
         t_e = ak.where(t_ends > self.t_max, self.t_max, t_ends)
@@ -147,9 +153,10 @@ class AttributionEngine:
 
         deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
         
-        all_starts = ak.concatenate([r.starts for r in ranks])
-        all_ends = ak.concatenate([r.ends for r in ranks])
-        active_counts = AttributionEngine._compute_coverage_ak(all_starts, all_ends, breaks)
+        active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
+        for r in ranks:
+            c = AttributionEngine._compute_coverage_ak(r.starts, r.ends, breaks)
+            active_counts += ak.where(c > 0, 1, 0)
 
         if concurrency_mode == 'shared':
             scaling = ak.where(active_counts < 1, 1, active_counts)
@@ -319,105 +326,137 @@ class Ensemble:
         return MetricConfig(kind=MetricType.INSTANTANEOUS)
 
     @staticmethod
-    def _load_metrics_task(args):
-        path, node, mpath, config_map = args
-        if not os.path.exists(mpath): return path, node, []
-        
-        # Load entire table with pandas engine='c' for speed
-        try:
-            df = pd.read_csv(mpath, engine='c', dtype={'Metric Name': 'category', 'Value': 'float64', 'Time': 'float64'}, usecols=['Metric Name', 'Time', 'Value'])
-        except Exception as e:
-            print(f"Error reading metrics {mpath}: {e}")
-            return path, node, []
-        
-        metrics_data = []
-        for m_name, group in df.groupby('Metric Name', observed=True):
-            cfg = Ensemble._resolve_config(m_name, config_map)
-            # Return numpy arrays to avoid pickling/thread issues with Arkouda objects
-            metrics_data.append((m_name, group['Time'].to_numpy(), group['Value'].to_numpy(), cfg))
-            
-        return path, node, metrics_data
-
-    @staticmethod
-    def _load_callgraph_task(args):
-        path, node, rank, cpath = args
-        if not os.path.exists(cpath): return path, node, rank, None
-        
-        try:
-            df = pd.read_csv(cpath, engine='c', dtype={
-                'Name': 'string', 'Start Time': 'float64', 'End Time': 'float64', 'Depth': 'int32', 'Duration': 'float64'
-            })
-            df = df[df['End Time'] > df['Start Time']]
-            # Convert to dict of numpy arrays for cleaner transfer
-            data = {
-                'Name': df['Name'].to_numpy().astype(str),
-                'Start Time': df['Start Time'].to_numpy(),
-                'End Time': df['End Time'].to_numpy(),
-                'Depth': df['Depth'].to_numpy().astype(np.int64),
-                'Duration': df['Duration'].to_numpy()
-            }
-            return path, node, rank, data
-        except Exception as e:
-            print(f"Error reading callgraph {cpath}: {e}")
-            return path, node, rank, None
-
-    @staticmethod
     def from_trace_paths(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}, max_workers: int = 32) -> 'Ensemble':
-        m_tasks = []
-        c_tasks = []
-        for path in trace_paths:
-            abs_path = os.path.abspath(path)
-            for node, ranks in node_ranks.items():
-                m_tasks.append((abs_path, node, os.path.join(abs_path, f"{ranks[0]}_metrics.csv"), metric_configs))
-                for rank in ranks:
-                    c_tasks.append((abs_path, node, rank, os.path.join(abs_path, f"{rank}_Master_thread_callgraph.csv")))
-
-        print(f"Loading {len(trace_paths)} runs on {max_workers} threads...")
-        m_res = defaultdict(list)
-        c_res = {}
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            # Metrics
-            fut_m = [ex.submit(Ensemble._load_metrics_task, t) for t in m_tasks]
-            for f in tqdm(as_completed(fut_m), total=len(fut_m), desc="Metrics", leave=False):
-                p, n, ms_data = f.result()
-                if ms_data: m_res[(p, n)] = ms_data
-            
-            # Callgraphs
-            fut_c = [ex.submit(Ensemble._load_callgraph_task, t) for t in c_tasks]
-            for f in tqdm(as_completed(fut_c), total=len(fut_c), desc="Callgraphs", leave=False):
-                p, n, r, d = f.result()
-                if d is not None: c_res[(p, n, r)] = d
-                
         runs = []
-        for path in trace_paths:
+        for path in tqdm(trace_paths, desc="Loading Runs"):
             abs_path = os.path.abspath(path)
             nodes = []
             for node_name, ranks in node_ranks.items():
-                # Convert loaded metric data to Arkouda objects
+                # IMPROVEMENT: Use Arkouda read_csv for scalable server-side loading
+                # Metric loading (Keep sequential as it's small and lacks ID)
+                m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.csv")
                 metrics = []
-                for m_name, t_np, v_np, cfg in m_res.get((abs_path, node_name), []):
+                if os.path.exists(m_path):
                     try:
-                        metrics.append(Metric(m_name, ak.array(t_np), ak.array(v_np), cfg))
+                        m_df = ak.read_csv(m_path, column_delim='|')
+                        if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
+                            m_names = m_df['Metric Name']
+                            g = ak.GroupBy(m_names)
+                            uk, _ = g.aggregate(m_names, 'first')
+                            unique_metrics = uk.to_ndarray().tolist()
+                            
+                            for m_name in unique_metrics:
+                                mask = (m_names == m_name)
+                                times = m_df['Time'][mask]
+                                values = m_df['Value'][mask]
+                                if times.dtype != ak.float64: times = ak.cast(times, ak.float64)
+                                if values.dtype != ak.float64: values = ak.cast(values, ak.float64)
+                                cfg = Ensemble._resolve_config(m_name, metric_configs)
+                                metrics.append(Metric(m_name, times, values, cfg))
                     except Exception as e:
-                        print(f"Error creating Metric {m_name}: {e}")
+                        print(f"Error loading metrics {m_path}: {e}")
 
-                loaded_ranks = []
+                # Callgraph loading - PARALLEL CLIENT OPTIMIZATION
+                # We use ThreadPoolExecutor to parse CSVs on client (fast) and transfer to Arkouda.
+                # This bypasses the slow sequential server-side read_csv.
+                
+                # Helper to parse one file
+                def parse_callgraph_client(path):
+                    try:
+                        import csv
+                        data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': []}
+                        with open(path, 'r') as f:
+                            reader = csv.reader(f, delimiter='|')
+                            header = next(reader, None) # Skip header
+                            for row in reader:
+                                if len(row) < 7: continue # Skip malformed lines
+                                # Indices: 0:Thread, 1:Group, 2:Depth, 3:Name, 4:Start, 5:End, 6:Duration
+                                data['Group'].append(row[1])
+                                data['Depth'].append(int(row[2]))
+                                data['Name'].append(row[3])
+                                data['Start Time'].append(float(row[4]))
+                                data['End Time'].append(float(row[5]))
+                                data['Duration'].append(float(row[6]))
+                        return (path, data)
+                    except Exception as e:
+                        return (path, e)
+
+                valid_c_paths = []
                 for r_id in ranks:
-                    if (abs_path, node_name, r_id) in c_res:
-                        data = c_res[(abs_path, node_name, r_id)]
-                        try:
-                            # Create DataFrame from dict of numpy arrays -> Arkouda handles conversion
-                            ak_dict = {k: ak.array(v) for k, v in data.items()}
-                            loaded_ranks.append(Rank(node_name, r_id, ak.DataFrame(ak_dict)))
-                        except Exception as e:
-                             print(f"Error creating Rank {r_id}: {e}")
-
+                    c_path = os.path.join(abs_path, f"{r_id}_Master_thread_callgraph.csv")
+                    if os.path.exists(c_path):
+                        valid_c_paths.append(c_path)
+                
+                loaded_ranks = []
+                if valid_c_paths:
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_path = {executor.submit(parse_callgraph_client, p): p for p in valid_c_paths}
+                        
+                        for future in concurrent.futures.as_completed(future_to_path):
+                            path, result = future.result()
+                            if isinstance(result, Exception):
+                                print(f"Error parse-loading callgraph {path}: {result}")
+                                continue
+                            
+                            # Transfer to Arkouda
+                            try:
+                                # Create dict of arrays
+                                ak_dict = {}
+                                ak_dict['Depth'] = ak.array(result['Depth'])
+                                ak_dict['Start Time'] = ak.array(result['Start Time'])
+                                ak_dict['End Time'] = ak.array(result['End Time'])
+                                ak_dict['Duration'] = ak.array(result['Duration'])
+                                ak_dict['Name'] = ak.array(result['Name'])
+                                ak_dict['Group'] = ak.array(result['Group'])
+                                
+                                c_df = ak.DataFrame(ak_dict)
+                                
+                                # Filter: End > Start
+                                mask = c_df['End Time'] > c_df['Start Time']
+                                c_df = Ensemble._apply_filter_to_dict(c_df, mask)
+                                
+                                # Identify Rank ID from path or group?
+                                # We can use the Group column or path.
+                                # The loop created paths based on ranks. 
+                                # Let's extract rank ID from filename or just use Group.
+                                # Using Group is safer if consistent.
+                                # But we know the filename corresponds to a rank ID in the loop iteration.
+                                # Wait, we lost the mapping from path -> r_id inside the future result.
+                                # Let's resolve it.
+                                
+                                # Extract r_id from Group column (assuming homogenous file)
+                                # Taking first element
+                                group_val = result['Group'][0] if result['Group'] else "Unknown"
+                                
+                                # Or better, use the Group column from the dataframe if we want to support mixed (we don't for now)
+                                loaded_ranks.append(Rank(node_name, group_val, c_df))
+                                
+                            except Exception as e:
+                                print(f"Error transferring callgraph {path}: {e}")
+                
                 if loaded_ranks:
                     nodes.append(Node(node_name, metrics, loaded_ranks))
             if nodes: runs.append(Run(abs_path, nodes))
         return Ensemble(runs)
 
+    @staticmethod
+    def load_hpl_trace(dir_path: str, ranks_per_node: int = 8, metric_configs: Dict = {}) -> 'Ensemble':
+        """
+        Helper to load standard HPL traces where:
+        - metrics are 'MPI Rank X_metrics.csv'
+        - callgraphs are 'MPI Rank X_Master_thread_callgraph.csv'
+        - Topology is Node0 -> Rank 0..N
+        """
+        ranks = [f"MPI Rank {i}" for i in range(ranks_per_node)]
+        # Assuming single node for now or user maps dirs. 
+        # But commonly we just want to load a directory as a "Node".
+        # Let's assume the directory represents one or more nodes.
+        # For simplicity, we create a basic topology.
+        topo = {"Node0": ranks}
+        return Ensemble.from_trace_paths([dir_path], topo, metric_configs)
+
+        
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver = lambda m, r: r, 
                   concurrency_mode: str = 'shared',
                   strategy: str = 'inclusive',
@@ -446,3 +485,5 @@ if __name__ == "__main__":
     ak_df = run.attribute("rocm_smi:::energy_count:device0", lambda m,r: r, strategy='inclusive')
     if len(ak_df) > 0:
         print(ak_df.to_pandas().head())
+
+from .visualizer import Visualizer
