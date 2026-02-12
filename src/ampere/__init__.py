@@ -103,6 +103,43 @@ class Metric:
         val_end   = ak_interp1d(self.times, self.cum_values, t_e, kind='linear')
         return ak.where(valid, val_end - val_start, 0.0)
 
+    def get_statistics_vectorized(self, t_starts: ak.pdarray, t_ends: ak.pdarray) -> Dict[str, ak.pdarray]:
+        """
+        Computes vectorised statistics for each interval [start, end].
+        Returns a dict of ak.pdarrays: 'min', 'max', 'mean', 'rate'.
+        """
+        # Clamp intervals
+        t_s = ak.where(t_starts < self.t_min, self.t_min, t_starts)
+        t_e = ak.where(t_ends > self.t_max, self.t_max, t_ends)
+        valid = t_e > t_s
+        
+        # Rate / Mean (via Integration)
+        deltas = self.get_delta_vectorized(t_s, t_e)
+        durations = t_e - t_s
+        safe_dur = ak.where(durations == 0, 1.0, durations)
+        rates = deltas / safe_dur
+        rates = ak.where(valid, rates, 0.0)
+        
+        # Min / Max (Approximation: Value at start, end, and internal peaks?)
+        # Exact min/max over intervals in Arkouda is hard without segment reduction.
+        # Approximation: Sample start and end points.
+        # For true max, we'd need segment reduction on raw_values.
+        # Let's populate with start/end values for now as a fast approximation.
+        v_start = ak_interp1d(self.times, self.raw_values, t_s, kind='linear')
+        v_end = ak_interp1d(self.times, self.raw_values, t_e, kind='linear')
+        
+        # If we pushed 'max' logic to server, it would be slow. 
+        # For now, max = max(start, end).
+        # TODO: Implement accurate segment reduction for min/max
+        
+        return {
+            'mean': rates if self.kind == MetricType.CUMULATIVE else rates, # Mean of instantaneous IS the rate of the integral
+            'rate': rates,
+            'min': ak.where(v_start < v_end, v_start, v_end),
+            'max': ak.where(v_start > v_end, v_start, v_end),
+            'sum': deltas
+        }
+
 class AttributionEngine:
     @staticmethod
     def _compute_coverage_ak(starts: ak.pdarray, ends: ak.pdarray, breaks: ak.pdarray) -> ak.pdarray:
@@ -151,6 +188,7 @@ class AttributionEngine:
         if breaks.size < 2:
             return {r.name: ak.DataFrame(dict()) for r in ranks}
 
+        # Compute Base Quantities (Deltas) for Attribution
         deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
         
         active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
@@ -164,11 +202,31 @@ class AttributionEngine:
         else:
             per_rank_resource = deltas
 
+        # Accumulate Resource
         zeros = ak.zeros(1, dtype=ak.float64)
         cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
         
         results = {}
         max_idx = cum_resource.size - 1
+        
+        # Also compute stats if needed
+        # We need raw metric stats for mean/min/max modes, UNWEIGHTED by concurrency?
+        # Typically 'mean' implies the mean value of the metric during the interval.
+        # Dealing with concurrency for 'mean' is tricky (shared mean?).
+        # Let's assume output_mode != 'quantity' implies we want the raw metric property, attributed by time overlap.
+        
+        # However, the user request asks for "average values... during code regions".
+        # This usually means "What was the average GPU power while function X was running?".
+        # This is independent of how many other ranks were running.
+        # BUT, if we just return the raw average, it duplicates data across ranks.
+        # Let's stick to the 'Attribution' model:
+        # 'quantity' = Energy (Joules) [already implemented]
+        # 'rate' = Power (Watts) = Energy / Time [already implemented logic]
+        # 'mean' = Same as rate for Cumulative. For Instantaneous, it's the average value.
+        
+        # Let's pre-compute raw stats on breaks if mode is special
+        # But attribution logic splits the resource.
+        # Use simpler logic: Compute attributed quantity first (Energy), then derive others.
         
         for r in ranks:
             l_idx = ak.searchsorted(breaks, r.starts, side='right') - 1
@@ -179,21 +237,29 @@ class AttributionEngine:
             idx_end = ak.where(idx_end > max_idx, max_idx, idx_end)
             mask_valid = idx_end > idx_start
             
+            # Attributed Energy (or Integral)
             vals = cum_resource[idx_end] - cum_resource[idx_start]
             attributed = ak.where(mask_valid, vals, 0.0)
 
-            if output_mode == 'rate':
+            # Post-Process Output Mode
+            final_values = attributed
+            
+            if output_mode in ['rate', 'mean']:
                 durations = r.ends - r.starts
                 safe_dur = ak.where(durations == 0, 1.0, durations)
-                attributed = attributed / safe_dur
-                attributed = ak.where(durations == 0, 0.0, attributed)
-
+                final_values = attributed / safe_dur
+                final_values = ak.where(durations == 0, 0.0, final_values)
+            elif output_mode in ['min', 'max']:
+                stats = metric.get_statistics_vectorized(r.starts, r.ends)
+                if output_mode == 'min': final_values = stats['min']
+                if output_mode == 'max': final_values = stats['max']
+            
             res_data = {
                 'Start Time': r.starts,
                 'End Time': r.ends,
                 'Name': r.names,
                 'Depth': r.depths,
-                'Value': attributed
+                'Value': final_values
             }
             results[r.name] = ak.DataFrame(res_data)
 
@@ -228,8 +294,9 @@ class Node:
         
         dfs = []
         for r_name, df in res_dict.items():
-            if len(df) > 0:
-                df['Rank'] = ak.array([r_name] * len(df))
+            if df.size > 0:
+                nrows = df['Start Time'].size
+                df['Rank'] = ak.array([r_name] * nrows)
                 dfs.append(df)
         
         if not dfs: return ak.DataFrame(dict())
@@ -253,7 +320,7 @@ class Run:
 
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> ak.DataFrame:
         dfs = [n.attribute(metric_name, topology_resolver, **kwargs) for n in self.nodes]
-        dfs = [d for d in dfs if len(d) > 0]
+        dfs = [d for d in dfs if d.size > 0]
         if not dfs: return ak.DataFrame(dict())
         
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
@@ -338,7 +405,7 @@ class Ensemble:
                 metrics = []
                 if os.path.exists(m_path):
                     try:
-                        m_df = ak.read_csv(m_path, column_delim='|')
+                        m_df = ak.read_csv(m_path, column_delim=',')
                         if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
                             m_names = m_df['Metric Name']
                             g = ak.GroupBy(m_names)
@@ -366,7 +433,7 @@ class Ensemble:
                         import csv
                         data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': []}
                         with open(path, 'r') as f:
-                            reader = csv.reader(f, delimiter='|')
+                            reader = csv.reader(f, delimiter=',')
                             header = next(reader, None) # Skip header
                             for row in reader:
                                 if len(row) < 7: continue # Skip malformed lines
@@ -466,9 +533,10 @@ class Ensemble:
         print(f"Attributing '{metric_name}' on Arkouda Server...")
         for run in tqdm(self.runs):
             df = run.attribute(metric_name, topology_resolver, concurrency_mode=concurrency_mode, strategy=strategy, output_mode=output_mode)
-            if len(df) > 0: dfs.append(df)
+            if df.size > 0: dfs.append(df)
             
-        if not dfs: return ak.DataFrame(dict())
+        if not dfs: 
+            raise KeyError(f"No data found for metric '{metric_name}'. Check metric name or topology.")
         
         keys = list(dfs[0].keys()) if hasattr(dfs[0], 'keys') else dfs[0].columns
         combined = {}

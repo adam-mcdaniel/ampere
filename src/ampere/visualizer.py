@@ -3,6 +3,9 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import arkouda as ak
+import matplotlib.pyplot as plt
+import seaborn as sns
+import arkouda as ak
 from . import MetricType
 
 class Visualizer:
@@ -332,5 +335,78 @@ class Visualizer:
         
         # Sincronizar zoom X
         fig.update_xaxes(matches='x')
+        
+        fig.show()
+
+    @staticmethod
+    def plot_heatmap(df, title: str = "Metric Heatmap", cmap: str = "viridis", save_path: str = None, annot: bool = True, fmt: str = ".1f", sort_by: str = "Value", top_n: int = 24, aggregation_func='mean'):
+        """
+        Plots a heatmap of the metric values (e.g., Rates) for each Rank and Function.
+        Aggregates by taking the mean value if multiple entries exist for a (Rank, Name) pair.
+        """
+
+        # Convert to Pandas for plotting if needed
+        if isinstance(df, ak.DataFrame):
+            pdf = df.to_pandas()
+        else:
+            pdf = df
+
+        if 'Rank' not in pdf.columns:
+            print("Warning: 'Rank' column missing for heatmap. Plotting aggregation over all data.")
+            pdf['Rank'] = 'All'
+
+        # Pivot: Index=Rank, Columns=Name, Values=Value (Mean)
+        matrix = pdf.pivot_table(index='Name', columns='Rank', values='Value', aggfunc=aggregation_func)
+        
+        # Sort by row-wise mean across all ranks, then take top N
+        matrix['_sort_key'] = matrix.mean(axis=1)
+        matrix = matrix.sort_values(by='_sort_key', ascending=False).head(top_n)
+        matrix = matrix.drop(columns=['_sort_key'])
+        
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(matrix, cmap=cmap, annot=annot, fmt=fmt, linewidths=.5)
+        plt.title(title)
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Heatmap saved to {save_path}")
+        else:
+            plt.show()
+
+    @staticmethod
+    def plot_distribution(
+        attributed_df, 
+        metric_name: str, 
+        bins: int = 50,
+        title: str = "Metric Distribution"
+    ):
+        """
+        Plots a histogram of the metric values. Useful for analyzing 
+        distributions of rates or means over function calls.
+        """
+        if isinstance(attributed_df, ak.DataFrame):
+            attributed_df = attributed_df.to_pandas()
+            
+        fig = go.Figure()
+        
+        # Group by Rank? Or global? 
+        # Let's show global distribution first, maybe colored by Rank if needed.
+        # Simple Histogram:
+        
+        fig.add_trace(go.Histogram(
+            x=attributed_df['Value'],
+            name='Global',
+            nbinsx=bins,
+            marker_color='#3366CC',
+            opacity=0.75
+        ))
+        
+        fig.update_layout(
+            title=f"{title}: {metric_name}",
+            xaxis_title=metric_name,
+            yaxis_title="Count (Function Calls)",
+            template="plotly_white",
+            bargap=0.1
+        )
         
         fig.show()
