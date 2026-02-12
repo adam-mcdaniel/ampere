@@ -358,10 +358,17 @@ class Visualizer:
         # Pivot: Index=Rank, Columns=Name, Values=Value (Mean)
         matrix = pdf.pivot_table(index='Name', columns='Rank', values='Value', aggfunc=aggregation_func)
         
-        # Sort by row-wise mean across all ranks, then take top N
-        matrix['_sort_key'] = matrix.mean(axis=1)
-        matrix = matrix.sort_values(by='_sort_key', ascending=False).head(top_n)
-        matrix = matrix.drop(columns=['_sort_key'])
+        # Sort by specific column if requested and valid
+        if sort_by in matrix.columns:
+            # matrix = matrix.sort_values(by=sort_by, ascending=False).head(top_n)
+            matrix['_sort_key'] = matrix[sort_by].sum(axis=1) # Sumar valores en la columna de ordenamiento para considerar todas las métricas
+            matrix = matrix.sort_values(by='_sort_key', ascending=False).head(top_n)
+            matrix = matrix.drop(columns=['_sort_key'])
+        else:
+            # Sort by row-wise mean across all ranks, then take top N
+            matrix['_sort_key'] = matrix.sum(axis=1)
+            matrix = matrix.sort_values(by='_sort_key', ascending=False).head(top_n)
+            matrix = matrix.drop(columns=['_sort_key'])
         
         plt.figure(figsize=(12, 8))
         sns.heatmap(matrix, cmap=cmap, annot=annot, fmt=fmt, linewidths=.5)

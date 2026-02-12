@@ -144,7 +144,7 @@ class AttributionEngine:
     @staticmethod
     def _compute_coverage_ak(starts: ak.pdarray, ends: ak.pdarray, breaks: ak.pdarray) -> ak.pdarray:
         l_idx = ak.searchsorted(breaks, starts, side='right') - 1
-        r_idx = ak.searchsorted(breaks, ends, side='left') - 1
+        r_idx = ak.searchsorted(breaks, ends, side='left')
         l_idx = ak.where(l_idx < 0, 0, l_idx)
         
         valid = r_idx > l_idx
@@ -179,8 +179,13 @@ class AttributionEngine:
         for r in ranks:
             mask_s = (r.starts >= metric.t_min) & (r.starts <= metric.t_max)
             mask_e = (r.ends >= metric.t_min) & (r.ends <= metric.t_max)
-            if mask_s.any(): time_arrays.append(r.starts[mask_s])
-            if mask_e.any(): time_arrays.append(r.ends[mask_e])
+            try:
+                if mask_s.any(): time_arrays.append(r.starts[mask_s])
+                if mask_e.any(): time_arrays.append(r.ends[mask_e])
+            except Exception:
+                # Fallback for old Arkouda versions or different array types
+                time_arrays.append(r.starts)
+                time_arrays.append(r.ends)
             
         merged = ak.concatenate(time_arrays)
         breaks = ak.unique(merged)
@@ -191,55 +196,204 @@ class AttributionEngine:
         # Compute Base Quantities (Deltas) for Attribution
         deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
         
+        # Calculate active counts or max depth depending on strategy
+        if strategy == 'exclusive':
+            # For exclusive, we need to know the MAX depth active in each interval for each rank/group?
+            # Actually, exclusive usually means "Exclusive to the deepest function in THIS rank".
+            # If we have multiple ranks (threads), exclusive usually applies per-thread.
+            # So for each interval, who owns it? The deepest function active.
+            pass 
+        else:
+            active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
+            for r in ranks:
+                c = AttributionEngine._compute_coverage_ak(r.starts, r.ends, breaks)
+                active_counts += ak.where(c > 0, 1, 0)
+
+            if concurrency_mode == 'shared':
+                scaling = ak.where(active_counts < 1, 1, active_counts)
+                per_rank_resource = deltas / scaling.astype(ak.float64)
+            else:
+                per_rank_resource = deltas
+
+            # Accumulate Resource
+            zeros = ak.zeros(1, dtype=ak.float64)
+            cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
+        
+        results = {}
+        
+        # Optimize: Pre-compute max depth for each rank if exclusive
+        # If exclusive, we don't have a single global "cum_resource" because each rank might claim different parts differently?
+        # Actually, if concurrency_mode=shared, we split the metric among active RANKS first.
+        # THEN within the rank, we give it to the deepest function.
+        
+        # Let's handle concurrency first (split metric between Ranks)
+        # Then handle exclusive (split metric within Rank)
+        
+        # Re-calc active_counts for concurrency splitting (needed for both)
         active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
+        rank_coverages = []
         for r in ranks:
             c = AttributionEngine._compute_coverage_ak(r.starts, r.ends, breaks)
+            rank_coverages.append(c)
             active_counts += ak.where(c > 0, 1, 0)
-
+            
         if concurrency_mode == 'shared':
             scaling = ak.where(active_counts < 1, 1, active_counts)
             per_rank_resource = deltas / scaling.astype(ak.float64)
         else:
             per_rank_resource = deltas
 
-        # Accumulate Resource
-        zeros = ak.zeros(1, dtype=ak.float64)
-        cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
+        # Now per_rank_resource is the amount of resource available to be claimed by THIS rank in this interval.
+        # Use this to build a cumulative curve? 
+        # For inclusive, we just need to know if we are active.
+        # For exclusive, we need to know if we are the DEEPEST active.
         
-        results = {}
-        max_idx = cum_resource.size - 1
-        
-        # Also compute stats if needed
-        # We need raw metric stats for mean/min/max modes, UNWEIGHTED by concurrency?
-        # Typically 'mean' implies the mean value of the metric during the interval.
-        # Dealing with concurrency for 'mean' is tricky (shared mean?).
-        # Let's assume output_mode != 'quantity' implies we want the raw metric property, attributed by time overlap.
-        
-        # However, the user request asks for "average values... during code regions".
-        # This usually means "What was the average GPU power while function X was running?".
-        # This is independent of how many other ranks were running.
-        # BUT, if we just return the raw average, it duplicates data across ranks.
-        # Let's stick to the 'Attribution' model:
-        # 'quantity' = Energy (Joules) [already implemented]
-        # 'rate' = Power (Watts) = Energy / Time [already implemented logic]
-        # 'mean' = Same as rate for Cumulative. For Instantaneous, it's the average value.
-        
-        # Let's pre-compute raw stats on breaks if mode is special
-        # But attribution logic splits the resource.
-        # Use simpler logic: Compute attributed quantity first (Energy), then derive others.
-        
-        for r in ranks:
+        for i, r in enumerate(ranks):
+            # 1. Identify intervals where this rank is active
+            # We have rank_coverages[i] which tells us overlap count (>=1 if active)
+            # But for exclusive, we need to check depths.
+            
+            # Get start/end indices in 'breaks' for each function call
             l_idx = ak.searchsorted(breaks, r.starts, side='right') - 1
             r_idx = ak.searchsorted(breaks, r.ends, side='left') - 1
             
             idx_start = ak.where(l_idx < 0, 0, l_idx)
+            # max_idx is breaks.size-1 (intervals) -> cum_resource has size intervals+1
+            max_idx = breaks.size - 1
             idx_end = r_idx + 1
             idx_end = ak.where(idx_end > max_idx, max_idx, idx_end)
             mask_valid = idx_end > idx_start
             
-            # Attributed Energy (or Integral)
-            vals = cum_resource[idx_end] - cum_resource[idx_start]
-            attributed = ak.where(mask_valid, vals, 0.0)
+            if strategy == 'exclusive':
+                # We need to compute, for each interval, what is the max depth ACTIVE for this rank?
+                # This is expensive to do purely vectorised if we have many calls.
+                # Project: Create an array of size 'breaks' with max_depth.
+                # Initialize with -1.
+                # For each function call, update intervals [s, e] with max(current, depth).
+                # This 'painting' is hard in Arkouda without loop.
+                # BUT, we can assume 'ranks' (which are usually threads) don't have THAT many nested calls?
+                # Actually, call graphs can be huge.
+                # Alternative: The 'Rank' object has flat arrays of start/end/depth.
+                
+                # To do this efficiently in Arkouda:
+                # We can allow the 'AttributionEngine' to call a server-side kernel if available?
+                # Or assume we can just loop over depths?
+                # Depths are usually small integers (0..100).
+                # Iterate depths descending.
+                
+                # 1. Find max depth in this Rank
+                # max_d = r.depths.max() # Need to handle if empty
+                # But we can iterate.
+                
+                # Let's map intervals to depths.
+                # We have 'per_rank_resource' for each interval.
+                # We want to assign it to depth D if D is the max active depth.
+                
+                # Algorithm:
+                # Create 'claimed' boolean array for intervals, init False.
+                # Iterate depths High -> Low.
+                # For Depth D:
+                #   Find all intervals covered by functions at Depth D.
+                #   Attribution = per_rank_resource * (not claimed).
+                #   Claimed |= covered.
+                #   Store this attribution for Depth D (as a mask or specific resource array).
+                
+                # Note: A function at Depth D adds to its own total.
+                # But wait, we return a DataFrame with one row per Function Call.
+                # So we need to ascribe value to specific calls.
+                
+                # Actually, "Exclusive" means: Value = Total_Inclusive - Sum(Children_Inclusive).
+                # This is the standard formula: Exclusive(X) = X_inclusive - Sum(Children of X)_inclusive.
+                # This avoids "painting" the timeline.
+                # But we need to identify children.
+                # In a flat list of calls, children are calls strictly contained within parent.
+                # This hierarchy discovery might be expensive in python/arkouda client-side?
+                # "Children" are calls that start >= parent.start and end <= parent.end AND depth = parent.depth + 1.
+                
+                # If we rely on the timeline painting (Attribution logic), it handles overlaps naturally.
+                # Let's use the Depth Iteration approach. It allows us to calculate "Exclusive resource available at Depth D".
+                
+                # 1. Compute 'Max Active Depth' per interval.
+                # How?
+                #   active_depths = zeros(intervals) - 1
+                #   For d in unique(depths):
+                #       mask_d = calls.depth == d
+                #       coverage_d = compute_coverage(starts[mask_d], ends[mask_d], breaks)
+                #       active_depths = where(coverage_d > 0, d, active_depths) 
+                #       (Wait, this overwrites. We want MAX. So iterate Low -> High or High -> Low?)
+                #       If we iterate Low -> High, we overwrite. Yes.
+                #       So after loop, active_depths holds the max depth.
+                
+                unique_depths = ak.unique(r.depths)
+                # Sort unique_depths
+                unique_depths = ak.sort(unique_depths)
+                
+                max_depth_per_interval = ak.zeros(breaks.size - 1, dtype=ak.int64) - 1
+                
+                for d in unique_depths.to_ndarray():
+                    mask_d = r.depths == d
+                    # Compute coverage for this depth
+                    cov = AttributionEngine._compute_coverage_ak(r.starts[mask_d], r.ends[mask_d], breaks)
+                    # If covered, set max_depth to d (since we iterate low->high, higher depths overwrite)
+                    max_depth_per_interval = ak.where(cov > 0, d, max_depth_per_interval)
+                
+                # We can build specific cumulative arrays for each depth? 
+                # Or just do check at attribution time?
+                # "Attribution Time" is calculating 'vals' for each call.
+                # for each call (start_idx, end_idx, depth):
+                #   sum(resource[i] WHERE max_depth[i] == depth)
+                
+                # To vectorise this:
+                # We can create a separate "resource_for_depth_D" array for each D.
+                # resource_for_depth_D[i] = per_rank_resource[i] if max_depth[i] == D else 0
+                # cum_resource_D = cumsum(resource_for_depth_D)
+                # val = cum_resource_D[end] - cum_resource_D[start]
+                
+                # This seems efficient enough if depth count is low.
+                
+                cum_resources_by_depth = {}
+                for d in unique_depths.to_ndarray():
+                    # d is a numpy scalar, we need to treat it carefully in where check if types mismatch
+                    # max_depth_per_interval is int64. d is likely numpy.int64.
+                    # Arkouda where(cond, x, y): cond must be pdarray(bool)
+                    
+                    mask_max_d = max_depth_per_interval == int(d)
+                    
+                    res_d = ak.where(mask_max_d, per_rank_resource, 0.0)
+                    zeros = ak.zeros(1, dtype=ak.float64)
+                    cum_resources_by_depth[d] = ak.concatenate([zeros, ak.cumsum(res_d)])
+                
+                # Now assign
+                # We need to iterate by depth groups to apply the correct cum_resource
+                
+                # Initialize output array
+                attributed = ak.zeros(r.starts.size, dtype=ak.float64)
+                
+                for d in unique_depths.to_ndarray():
+                    mask_calls_at_d = r.depths == d
+                    if not mask_calls_at_d.any(): continue
+                    
+                    # Indices for these calls
+                    s_idx = idx_start[mask_calls_at_d]
+                    e_idx = idx_end[mask_calls_at_d]
+                    
+                    # Use the specific cumulative array
+                    c_res = cum_resources_by_depth[d]
+                    vals = c_res[e_idx] - c_res[s_idx]
+                    
+                    # Create sparse array and add?
+                    # Or just simple assignment if supported.
+                    # Assuming standard ak assignment works.
+                    attributed[mask_calls_at_d] = vals
+                
+            else:
+                # Inclusive
+                # Resource is just per_rank_resource
+                zeros = ak.zeros(1, dtype=ak.float64)
+                cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
+                
+                vals = cum_resource[idx_end] - cum_resource[idx_start]
+                attributed = ak.where(mask_valid, vals, 0.0)
 
             # Post-Process Output Mode
             final_values = attributed
