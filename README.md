@@ -25,6 +25,7 @@ The snippet below does the following:
 
 ```python
 import re
+import arkouda as ak
 from ampere import Ensemble, MetricConfig, MetricType, AmpereSession, Visualizer, connect
 
 connect(server="localhost", port=5555)
