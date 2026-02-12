@@ -2,6 +2,8 @@ import arkouda as ak
 import numpy as np 
 import os
 import re
+import csv
+import concurrent.futures
 from enum import Enum
 from typing import Dict, List, Tuple, Optional, Union, Any, Literal, Callable, Pattern
 from collections import defaultdict
@@ -584,7 +586,6 @@ class Ensemble:
                 # Helper to parse one file
                 def parse_callgraph_client(path):
                     try:
-                        import csv
                         data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': []}
                         with open(path, 'r') as f:
                             reader = csv.reader(f, delimiter=',')
@@ -610,7 +611,6 @@ class Ensemble:
                 
                 loaded_ranks = []
                 if valid_c_paths:
-                    import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                         future_to_path = {executor.submit(parse_callgraph_client, p): p for p in valid_c_paths}
                         
@@ -660,23 +660,6 @@ class Ensemble:
                     nodes.append(Node(node_name, metrics, loaded_ranks))
             if nodes: runs.append(Run(abs_path, nodes))
         return Ensemble(runs)
-
-    @staticmethod
-    def load_hpl_trace(dir_path: str, ranks_per_node: int = 8, metric_configs: Dict = {}) -> 'Ensemble':
-        """
-        Helper to load standard HPL traces where:
-        - metrics are 'MPI Rank X_metrics.csv'
-        - callgraphs are 'MPI Rank X_Master_thread_callgraph.csv'
-        - Topology is Node0 -> Rank 0..N
-        """
-        ranks = [f"MPI Rank {i}" for i in range(ranks_per_node)]
-        # Assuming single node for now or user maps dirs. 
-        # But commonly we just want to load a directory as a "Node".
-        # Let's assume the directory represents one or more nodes.
-        # For simplicity, we create a basic topology.
-        topo = {"Node0": ranks}
-        return Ensemble.from_trace_paths([dir_path], topo, metric_configs)
-
         
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver = lambda m, r: r, 
                   concurrency_mode: str = 'shared',
