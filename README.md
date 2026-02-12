@@ -18,6 +18,7 @@ cd ampere && pip install .
 ### Setting Up Metric Configurations and Topology
 
 The snippet below does the following:
+
 1. Connects to the Arkouda server to enable distributed data processing for large traces.
 2. Defines metric configurations using regular expressions to match metric names, specifying whether they are cumulative or instantaneous and applying a scale factor to convert raw values to more interpretable units (e.g., from microjoules to joules). This will allow Ampere to automatically apply the correct processing logic to each metric based on its name.
 3. Defines a custom topology resolver function that maps metric names to the corresponding MPI ranks based on the device they are associated with. This is necessary because in this example, each GPU device is shared by 2 MPI ranks, so we need to ensure that the metrics are correctly attributed to the ranks that are using the corresponding GPU devices. For example, GPU energy usage must be shared between the ranks that are using that GPU, rather than being attributed to all ranks or just one rank.
@@ -80,8 +81,8 @@ Next, we can visualize this data as a Flamegraph to show where the GPu energy us
 # Visualize Flamegraph for Rank 0
 print("Generating Flamegraph...")
 Visualizer.plot_flamegraph(
-    df_joules, 
-    rank_filter="MPI Rank 0", 
+    df_joules,
+    rank_filter="MPI Rank 0",
     metric_name="Joules"
 )
 ```
@@ -98,12 +99,11 @@ Visualizer.plot_node_view(
     attributed_df=df_joules,
     ranks=["MPI Rank 0", "MPI Rank 1"],
     metrics_data=metrics_to_plot,
-    title = "Power Lines vs Callgraph for Node 0 (Exclusive Attribution)
+    title="Node 0 Analysis: Power Lines vs Function Execution"
 )
 ```
 
 ![Flamegraph](assets/flamegraph3.png)
-
 
 ### Visualizing Heatmaps of Energy and Power
 
@@ -118,7 +118,6 @@ Visualizer.plot_heatmap(df_joules, "Energy Heatmap (Rank vs Function)", cmap='co
 
 Interesting! Here we see that `rocblas_dgemm` uses almost all the GPU energy, followed by `MPI_Waitany`. This is expected since `rocblas_dgemm` is the main driver of the computation in HPL, and `MPI_Waitany` is likely stalling on communication while waiting for messages to arrive from other ranks. We can also visualize the power usage in a similar way, by taking the derivative of the cumulative energy to get the instantaneous power, and plotting a heatmap of that:
 
-
 ```python
 # Get the power by taking the derivative of the energy metric, and plot a heatmap of the results
 df_energy_rate = ak.DataFrame.concat([
@@ -127,7 +126,11 @@ df_energy_rate = ak.DataFrame.concat([
         topology_resolver=my_hpc_topology,
         output_mode='rate',
         strategy='exclusive'
-    ) for metric in ["A2rocm_smi:::energy_count:device=0", "A2rocm_smi:::energy_count:device=2", "A2rocm_smi:::energy_count:device=4", "A2rocm_smi:::energy_count:device=6"]
+    ) for metric in [
+        "A2rocm_smi:::energy_count:device=0",
+        "A2rocm_smi:::energy_count:device=2",
+        "A2rocm_smi:::energy_count:device=4",
+        "A2rocm_smi:::energy_count:device=6"]
 ])
 
 # Visualize Heatmap of Rates
