@@ -102,7 +102,7 @@ Visualizer.plot_node_view(
 )
 ```
 
-![Flamegraph](assets/flamegraph2.png)
+![Flamegraph](assets/flamegraph3.png)
 
 
 ### Visualizing Heatmaps of Energy and Power
@@ -136,3 +136,5 @@ Visualizer.plot_heatmap(df_energy_rate, "Power Rate Heatmap (Rank vs Function)",
 ```
 
 ![Power Heatmap](assets/hpl-power.png)
+
+Some strange functions show up as 'hot' here (`MPI_Comm_size`), but consider that these functions are extremely short in duration (some as short as `0.000000220` seconds) and extremely low in energy consumption, which skews the wattage calculation. So these results are consistent with our expectations: when accounting for function durations, `rocblas_dgemm` is the most energy and power intensive function, followed by `rocblas_dtrsm` (another level 3 BLAS routine).
