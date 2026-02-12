@@ -1,4 +1,4 @@
-# ampere
+# ampere⚡
 
 A tool for analyzing ensembles or individual runs of exascale OTF2 traces and attributing metrics (primarily energy and power) to functions and code regions. It provides visualizations such as heatmaps and flamegraphs to help identify energy hotspots in the code. It utilizes [Arkouda](https://github.com/Bears-R-Us/arkouda) to handle arbitrarily large traces that don't fit in a single node's memory, and is designed to be extensible to support new metrics and visualizations.
 
