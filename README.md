@@ -2,6 +2,14 @@
 
 A tool for analyzing ensembles or individual runs of exascale OTF2 traces and attributing metrics (primarily energy and power) to functions and code regions. It provides visualizations such as heatmaps and flamegraphs to help identify energy hotspots in the code. It utilizes [Arkouda](https://github.com/Bears-R-Us/arkouda) to handle arbitrarily large traces that don't fit in a single node's memory, and is designed to be extensible to support new metrics and visualizations.
 
+## Table of Contents
+
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Setting Up Metric Configurations and Topology](#setting-up-metric-configurations-and-topology)
+  - [Analyzing and Visualizing Node Metrics](#analyzing-and-visualizing-node-metrics)
+  - [Visualizing Heatmaps of Energy and Power](#visualizing-heatmaps-of-energy-and-power)
+
 ## Installation
 
 Ampere uses python and can be installed via pip. It's recommended to use `conda` to manage your dependencies since the required Pandas and Numpy versions may conflict with your other packages.
