@@ -12,9 +12,24 @@ class Visualizer:
     @staticmethod
     def _fast_downsample(subset: pd.DataFrame, width_pixels=2000):
         """
-        Versión NumPy Ultra-Rápida de downsampling.
-        Reemplaza a pandas groupby con np.maximum.reduceat.
-        Velocidad: ~100x más rápido que Pandas para datasets grandes.
+        Ultra-Fast NumPy Downsampling.
+        
+        Replaces pandas groupby with np.maximum.reduceat for significantly improved performance.
+        Speedup: ~100x faster than Pandas for large datasets.
+        
+        Args:
+            subset (pd.DataFrame): Source DataFrame.
+                Required Columns:
+                - 'Start Time' (float): Timestamp.
+                - 'End Time' (float): Timestamp.
+                - 'Value' (float): Numeric metric value to aggregate (max).
+                - 'Depth' (int): Stack depth (processed independently).
+                - 'Name' (str/category): Function name.
+            width_pixels (int): Target width in pixels for the visualization.
+
+        Returns:
+            pd.DataFrame: Downsampled DataFrame with the same columns, where rows are aggregated 
+                          to fit the pixel density.
         """
         # Extraer arrays numpy (copia cero si es posible)
         starts = subset['Start Time'].values
@@ -33,9 +48,9 @@ class Visualizer:
         # Vectorized binning
         pixel_indices = ((starts - t_min) * scale).astype(np.int32)
         
-        # --- ESTRATEGIA: Procesar por Profundidad (Depth) ---
-        # Como 'Depth' es discreto y pequeño (ej. 0-50), iterar profundidades 
-        # y usar vectorización 1D es mucho más rápido que un groupby 2D complejo.
+        # --- STRATEGY: Process by Depth ---
+        # Since 'Depth' is discrete and small (e.g., 0-50), iterating depths
+        # and using 1D vectorization is much faster than a complex 2D groupby.
         
         aggregated_chunks = []
         unique_depths = np.unique(depths)
@@ -69,12 +84,12 @@ class Visualizer:
             # np.unique ya nos da exactamente lo que reduceat necesita (casi)
             # jump_indices sirve como los 'indices' para reduceat
             
-            # Agregaciones ultrarrápidas en C
+            # Fast reductions using reduceat
             agg_s = np.minimum.reduceat(s_d, jump_indices)
             agg_e = np.maximum.reduceat(e_d, jump_indices)
-            agg_v = np.maximum.reduceat(v_d, jump_indices) # Max energía en el pixel
+            agg_v = np.maximum.reduceat(v_d, jump_indices) # Max energy in the pixel
             
-            # Para nombres, tomamos el primero del bin (o el más largo si quisiéramos complicarlo)
+            # For names, we take the first one in the bin
             agg_n = n_d[jump_indices]
             
             # Construir bloque
@@ -103,8 +118,22 @@ class Visualizer:
         min_pixel_width: float = 0.5
     ):
         """
-        Flamegraph usando Heatmap (Más robusto y rápido que Scattergl lines).
-        Convierte los eventos en rectángulos visuales.
+        Generates a Flamegraph using a Heatmap (More robust and faster than Scattergl lines).
+        Converts events into visual rectangles, optimized for large datasets.
+
+        Args:
+            df (pd.DataFrame or ak.DataFrame): Input data.
+                Required Columns:
+                - 'Rank' (str): Identifier for filtering.
+                - 'Start Time' (float): Event start.
+                - 'End Time' (float): Event end.
+                - 'Value' (float): Metric intensity (color).
+                - 'Depth' (int): Y-axis position.
+                - 'Name' (str): Hover label.
+            rank_filter (str): The specific Rank (thread/process) to visualize.
+            metric_name (str): Label for the colorbar.
+            title (str): Title of the plot.
+            min_pixel_width (float): Minimum pixel width for culling small events.
         """
         # Convert to pandas if input is Arkouda DataFrame
         if isinstance(df, ak.DataFrame):
@@ -140,16 +169,16 @@ class Visualizer:
         t_max = subset['End Time'].max()
         time_per_pixel = (t_max - t_min) / screen_width
         
-        # Asignar cada evento a un pixel_bucket
+        # Assign each event to a pixel_bucket
         subset['pixel_idx'] = ((subset['Start Time'] - t_min) / time_per_pixel).astype(int)
         
-        # Agrupar por (Depth, Pixel)
-        # Tomamos el valor MAX de energía en ese pixel para no perder picos
+        # Group by (Depth, Pixel)
+        # We take the MAX value of energy in that pixel to avoid losing peaks
         agg = subset.groupby(['Depth', 'pixel_idx']).agg({
             'Start Time': 'min',
-            'End Time': 'max', # Extendemos para cubrir huecos
-            'Value': 'max',    # Conservamos hotspots
-            'Name': 'first'    # Nombre representativo
+            'End Time': 'max', # Extend to cover gaps
+            'Value': 'max',    # Keep hotspots
+            'Name': 'first'    # Representative name
         }).reset_index()
         
         agg['Duration'] = agg['End Time'] - agg['Start Time']
@@ -203,6 +232,15 @@ class Visualizer:
         metrics_data: list = [], 
         title: str = "Node Performance View"
     ):
+        """
+        Visualizes node performance by combining global metrics (line plots) and per-rank flamegraphs.
+
+        Args:
+            attributed_df (pd.DataFrame or ak.DataFrame): Data for flamegraphs (see plot_flamegraph for columns).
+            ranks (list): List of rank names to plot.
+            metrics_data (list): List of metric objects (name, times, values) for the top line plot.
+            title (str): Title of the combined view.
+        """
         # Convert to pandas if input is Arkouda DataFrame
         if isinstance(attributed_df, ak.DataFrame):
             attributed_df = attributed_df.to_pandas()
@@ -220,7 +258,7 @@ class Visualizer:
             subplot_titles=["Node Metrics"] + ranks
         )
 
-        # --- 1. DIBUJAR LÍNEAS (Optimizado con Decimación) ---
+        # --- 1. DRAW LINES (Optimized with Decimation) ---
         print(f"Plotting metrics...")
         for m in metrics_data:
             if hasattr(m, 'name'): name, times, values = m.name, m.times, m.values
@@ -238,9 +276,9 @@ class Visualizer:
             # elif hasattr(m, 'cfg') and m.cfg.kind == MetricType.CUMULATIVE: # Handle tuple from loader
             #     values = values - values[0]
             
-            # OPTIMIZACIÓN LÍNEAS:
-            # Si hay > 10k puntos, el navegador sufre. Decimamos visualmente.
-            # Tomamos 1 de cada N puntos para mantener la forma general.
+            # LINE OPTIMIZATION:
+            # If there are > 10k points, the browser suffers. We visually decimate.
+            # We take 1 out of every N points to maintain the general shape.
             limit = 1000
             if len(times) > limit:
                 step = len(times) // limit
@@ -258,7 +296,7 @@ class Visualizer:
                 row=1, col=1
             )
 
-        # --- 2. DIBUJAR FLAMEGRAPHS (Optimizado con NumPy) ---
+        # --- 2. DRAW FLAMEGRAPHS (Optimized with NumPy) ---
         # Pre-calcular escala de color global
         if not attributed_df.empty:
             cmin, cmax = attributed_df['Value'].min(), attributed_df['Value'].max()
@@ -273,12 +311,12 @@ class Visualizer:
             
             if subset.empty: continue
             
-            # USAR EL NUEVO DOWNSAMPLER VECTORIZADO
+            # Use new vectorized downsampler
             agg = Visualizer._fast_downsample(subset)
             
             if agg.empty: continue
 
-            # Hover Text Vectorizado
+            # Vectorized Hover Text
             # Usar comprensión de lista es a menudo más rápido que .apply en strings
             hover_text = [
                 f"<b>{n}</b><br>Depth: {d}<br>Val: {v:.4e}" 
@@ -305,11 +343,11 @@ class Visualizer:
                 row=i + 2, col=1
             )
             
-            # Configurar Ejes Y (Invertido y Fijo)
+            # Configure Y Axes (Inverted and Fixed)
             fig.update_yaxes(
                 autorange="reversed", 
                 fixedrange=True, 
-                showticklabels=False, # Ocultar etiquetas numéricas de profundidad para limpiar
+                showticklabels=False, # Hide numeric depth labels for cleanliness
                 title_text=rank_name,
                 row=i+2, col=1
             )
@@ -343,6 +381,21 @@ class Visualizer:
         """
         Plots a heatmap of the metric values (e.g., Rates) for each Rank and Function.
         Aggregates by taking the mean value if multiple entries exist for a (Rank, Name) pair.
+
+        Args:
+            df (pd.DataFrame or ak.DataFrame): Input data.
+                Required Columns:
+                - 'Rank' (str): X-axis grouping.
+                - 'Name' (str): Y-axis grouping.
+                - 'Value' (float): Heatmap intensity.
+            title (str): Plot title.
+            cmap (str): Colormap name.
+            save_path (str, optional): Path to save the figure. If None, shows the plot.
+            annot (bool): Whether to annotate cells with values.
+            fmt (str): Format string for annotations.
+            sort_by (str): Column to sort by (default 'Value').
+            top_n (int): Number of top functions to display.
+            aggregation_func (str): Aggregation function for pivot table ('mean', 'sum', 'max', etc.).
         """
 
         # Convert to Pandas for plotting if needed
@@ -390,6 +443,12 @@ class Visualizer:
         """
         Plots a histogram of the metric values. Useful for analyzing 
         distributions of rates or means over function calls.
+
+        Args:
+            attributed_df (pd.DataFrame or ak.DataFrame): Input data.
+            metric_name (str): Label for the X-axis.
+            bins (int): Number of histogram bins.
+            title (str): Plot title.
         """
         if isinstance(attributed_df, ak.DataFrame):
             attributed_df = attributed_df.to_pandas()

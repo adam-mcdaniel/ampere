@@ -1,3 +1,12 @@
 src/*.egg-info
 build/
 __pycache__
+**/*/__pycache__
+.DS_Store
+/a.out
+/arkouda_server
+/otf2csv
+/otf2csv.c
+/*.txt
+/iframe_figures
+/*.png
