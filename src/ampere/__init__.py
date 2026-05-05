@@ -708,6 +708,7 @@ class Node:
                 self.metrics[name] = new_metric
         except Exception as e:
             print(f"Failed to derive metric '{name}' for node '{self.name}': {e}")
+            raise e
 
     def attribute(self, metric_name: str, topology_resolver: TopologyResolver, **kwargs) -> Any:
         """
