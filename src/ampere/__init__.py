@@ -561,6 +561,7 @@ class AttributionEngine:
         else:
             deltas = breaks[1:] - breaks[:-1]
 
+
         rank_coverages = []
         if concurrency_mode == 'shared':
             active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
@@ -721,7 +722,9 @@ class Node:
         Returns:
             Any: Combined attribution results for all participating ranks.
         """
-        if metric_name not in self.metrics: return ak.DataFrame(dict())
+        if metric_name not in self.metrics: 
+            print(f'Did not find metric "{metric_name}" in node "{self.name}". Available metrics: {list(self.metrics.keys())}')
+            return ak.DataFrame(dict())
         participating = topology_resolver(metric_name, self.ranks)
         if not participating:
             print(f"Warning: Topology resolver for '{metric_name}' returned no ranks. Available ranks: {[r.name for r in self.ranks]}")
@@ -733,7 +736,7 @@ class Node:
         for r_name, df in res_dict.items():
             if df.size > 0:
                 nrows = df['Start Time'].size
-                df['Rank'] = ak.array(np.full(nrows, r_name))
+                df['Rank'] = ak.full(nrows, r_name)
                 dfs.append(df)
 
         if not dfs: return ak.DataFrame(dict())
@@ -744,7 +747,7 @@ class Node:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Node'] = ak.array(np.full(nrows, self.name))
+        combined['Node'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
     def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> Any:
@@ -767,7 +770,7 @@ class Node:
         for r_name, df in res_dict.items():
             if df.size > 0:
                 nrows = df['Start Time'].size
-                df['Rank'] = ak.array(np.full(nrows, r_name))
+                df['Rank'] = ak.full(nrows, r_name)
                 dfs.append(df)
 
         if not dfs: return ak.DataFrame(dict())
@@ -778,7 +781,7 @@ class Node:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Node'] = ak.array(np.full(nrows, self.name))
+        combined['Node'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
 class Run:
@@ -834,7 +837,7 @@ class Run:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Run'] = ak.array(np.full(nrows, self.name))
+        combined['Run'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
     def time_profile(self, topology_resolver: TopologyResolver = lambda m, r: r, strategy: str = 'inclusive') -> Any:
@@ -858,7 +861,7 @@ class Run:
             parts = [d[k] for d in dfs]
             combined[k] = None if all(p is None for p in parts) else ak.concatenate(parts)
         nrows = next(v for v in combined.values() if v is not None).size
-        combined['Run'] = ak.array(np.full(nrows, self.name))
+        combined['Run'] = ak.full(nrows, self.name)
         return ak.DataFrame(combined)
 
 # ==========================================
@@ -935,7 +938,128 @@ class Ensemble:
             if isinstance(k, str) and k.startswith('^') and re.match(k, name): return v
         return MetricConfig(kind=MetricType.INSTANTANEOUS)
 
+
     @staticmethod
+    def from_trace_paths_parquet(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}) -> 'Ensemble':
+        """
+        Loads multiple trace runs in parallel and constructs an Ensemble from traces stored in Parquet format.
+
+
+        Args:
+            trace_paths (List[str]): List of file paths to trace directories.
+            node_ranks (Dict): Dictionary mapping Node names to lists of Rank IDs (e.g., {"Node1": ["Rank0", "Rank1"]}).
+            metric_configs (Dict): Dictionary mapping metric naming patterns to `MetricConfig` objects.
+
+        """
+        runs = []
+        for path in tqdm(trace_paths, desc="Loading Runs"):
+            abs_path = os.path.abspath(path)
+            nodes = []
+            for node_name, ranks in node_ranks.items():
+                # IMPROVEMENT: Use Arkouda read_csv for scalable server-side loading
+                # Metric loading (Keep sequential as it's small and lacks ID)
+                m_path = os.path.join(abs_path, f"{ranks[0]}_metrics.parquet")
+                metrics = []
+                if os.path.exists(m_path):
+                    try:
+                        m_df = ak.read_parquet(m_path)
+                        if 'metric_name' in m_df and 'time' in m_df and 'value_int' in m_df:
+                            m_names = m_df['metric_name']
+                            g = ak.GroupBy(m_names)
+                            uk, _ = g.aggregate(m_names, 'first')
+                            unique_metrics = uk.to_ndarray().tolist()
+                            
+                            for m_name in unique_metrics:
+                                mask = (m_names == m_name)
+                                times = m_df['time'][mask]
+                                values = m_df['value_int'][mask]
+                                if times.dtype != ak.float64: times = ak.cast(times, ak.float64)
+                                if values.dtype != ak.float64: values = ak.cast(values, ak.float64)
+                                cfg = Ensemble._resolve_config(m_name, metric_configs)
+                                metrics.append(Metric(m_name, times, values, cfg))
+                        else:
+                            print(f"Warning: Metrics file {m_path} is missing required columns. Skipping metrics for node '{node_name}'.")
+                    except Exception as e:
+                        print(f"Error loading metrics {m_path}: {e}")
+        
+                valid_c_paths = []
+                for r_id in ranks:
+                    c_path = os.path.join(abs_path, f"{r_id}_Master_thread_callgraph.parquet")
+                    if os.path.exists(c_path):
+                        valid_c_paths.append(c_path)
+                
+                # Also discover additional callgraph files (e.g., HIP Context GPU traces)
+                try:
+                    for fname in os.listdir(abs_path):
+                        if fname.endswith("_callgraph.parquet"):
+                            extra_path = os.path.join(abs_path, fname)
+                            if extra_path in valid_c_paths:
+                                continue
+                            if 'MPI Rank ' in fname:
+                                continue
+                            valid_c_paths.append(extra_path)
+                except OSError:
+                    pass
+
+                if not valid_c_paths:
+                    print(f"Warning: No valid callgraph files found for node '{node_name}' in path '{abs_path}'.")
+                    continue
+                
+                loaded_ranks = []
+                for valid_path in valid_c_paths:
+                    data = {'Depth': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Name': [], 'Group': [], 'Metadata': []}
+                    
+                    try:    
+                        
+                        df = ak.read_parquet(valid_path)
+
+                        data['Group'] = df['group']
+                        data['Depth'] = df['depth']
+                        data['Name'] = df['name']
+                        data['Start Time'] = df['start_time']
+                        data['End Time'] = df['end_time']
+                        if 'duration' in df:
+                            data['Duration'] = df['duration']
+                        else:
+                            data['Duration'] = df['end_time'] - df['start_time']
+                        if 'metadata' in df:
+                            data['Metadata'] = df['metadata']
+                        else:
+                            data['Metadata'] = ak.full(df['name'].size, "")
+                    except Exception as e:
+                        print(f"Error loading callgraph {valid_path}: {e}")
+
+                    # Skip empty data (header-only files with no data rows)
+                    if not data.get('Name'):
+                        print(f"Warning: Callgraph file {valid_path} is empty or has no valid data. Skipping.")
+                        continue
+
+                    c_df = ak.DataFrame(data)
+                    
+                    # Filter: End > Start
+                    mask = c_df['End Time'] > c_df['Start Time']
+                    c_df = Ensemble._apply_filter_to_dict(c_df, mask)
+                    
+                    # Identify Rank ID from path or group
+                    # We first check the Group column, which is reliable if consistent.
+                    # Alternatively, we could assume the filename maps to a rank ID as iterated in the loop.
+                    # Here, we extract the rank ID from the Group column of the first row.
+                    group_val = data['Group'][0] if data['Group'] else "Unknown"
+
+                    # For non-MPI callgraphs (e.g., HIP GPU contexts), derive
+                    # a unique rank name from the filename to avoid collisions
+                    # when multiple streams share the same Group value.
+                    basename = os.path.basename(valid_path)
+                    if basename.startswith("MPI Rank"):
+                        rank_name = group_val
+                    else:
+                        rank_name = basename.rsplit('_callgraph', 1)[0]
+                    loaded_ranks.append(Rank(node_name, rank_name, c_df))
+                if loaded_ranks:
+                    nodes.append(Node(node_name, metrics, loaded_ranks))
+            if nodes: runs.append(Run(abs_path, nodes))
+        return Ensemble(runs)
+
     def from_trace_paths(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}, max_workers: int = 32) -> 'Ensemble':
         """
         Loads multiple trace runs in parallel and constructs an Ensemble.
@@ -1085,7 +1209,7 @@ class Ensemble:
                     nodes.append(Node(node_name, metrics, loaded_ranks))
             if nodes: runs.append(Run(abs_path, nodes))
         return Ensemble(runs)
-        
+    
     def add_derived_metric(self, name: str, func: Callable[..., Metric], *input_names: str):
         """
         Adds a derived metric to all runs in the ensemble.
