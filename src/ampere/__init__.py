@@ -965,9 +965,12 @@ class Ensemble:
                         m_df = ak.read_parquet(m_path)
                         if 'metric_name' in m_df and 'time' in m_df and 'value_int' in m_df:
                             m_names = m_df['metric_name']
-                            g = ak.GroupBy(m_names)
-                            uk, _ = g.aggregate(m_names, 'first')
-                            unique_metrics = uk.to_ndarray().tolist()
+                            # Unique metric names via ak.unique (works on BOTH backends).
+                            # NOTE: the old `GroupBy(m_names).aggregate(m_names, 'first')` dance
+                            # to get uniques no longer works on newer arkouda -- it rejects a
+                            # Strings *values* column ("Unsupported values type for Arkouda
+                            # GroupBy reductions: ... Strings"). ak.unique avoids GroupBy entirely.
+                            unique_metrics = ak.unique(m_names).to_ndarray().tolist()
                             
                             for m_name in unique_metrics:
                                 mask = (m_names == m_name)
@@ -1090,9 +1093,12 @@ class Ensemble:
                         m_df = ak.read_csv(m_path, column_delim=',')
                         if 'Metric Name' in m_df and 'Time' in m_df and 'Value' in m_df:
                             m_names = m_df['Metric Name']
-                            g = ak.GroupBy(m_names)
-                            uk, _ = g.aggregate(m_names, 'first')
-                            unique_metrics = uk.to_ndarray().tolist()
+                            # Unique metric names via ak.unique (works on BOTH backends).
+                            # NOTE: the old `GroupBy(m_names).aggregate(m_names, 'first')` dance
+                            # to get uniques no longer works on newer arkouda -- it rejects a
+                            # Strings *values* column ("Unsupported values type for Arkouda
+                            # GroupBy reductions: ... Strings"). ak.unique avoids GroupBy entirely.
+                            unique_metrics = ak.unique(m_names).to_ndarray().tolist()
                             
                             for m_name in unique_metrics:
                                 mask = (m_names == m_name)
