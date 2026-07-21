@@ -353,6 +353,68 @@ class AttributionEngine:
         return np.maximum(0.0, weights - children_sum)
 
     @staticmethod
+    def _exclusive_ak(starts_ak, ends_ak, weights_ak, depths_ak):
+        """
+        O(K log K) exclusive attribution via the identity:
+            exclusive[k] = inclusive[k] - sum(inclusive[direct_children_of_k])
+        Implemented natively in Arkouda without global timelines.
+        """
+        K = starts_ak.size
+        if K == 0:
+            return ak.zeros(0, dtype=ak.float64)
+            
+        parent = ak.zeros(K, dtype=ak.int64) - 1
+        
+        unique_d = ak.unique(depths_ak)
+        unique_d = ak.sort(unique_d).to_ndarray()
+        
+        for d in unique_d[1:]:
+            c_mask = (depths_ak == d)
+            p_mask = (depths_ak < d)
+            
+            if not c_mask.any() or not p_mask.any():
+                continue
+                
+            p_idxs = ak.arange(K)[p_mask]
+            p_starts = starts_ak[p_mask]
+            
+            p_ord = ak.argsort(p_starts)
+            p_starts_sorted = p_starts[p_ord]
+            p_orig = p_idxs[p_ord]
+            
+            c_starts = starts_ak[c_mask]
+            c_orig = ak.arange(K)[c_mask]
+            
+            pos = ak.searchsorted(p_starts_sorted, c_starts, side='right') - 1
+            valid = pos >= 0
+            
+            if not valid.any():
+                continue
+                
+            valid_c_orig = c_orig[valid]
+            valid_cand_p = p_orig[pos[valid]]
+            
+            enclosed = ends_ak[valid_cand_p] >= ends_ak[valid_c_orig]
+            
+            if enclosed.any():
+                final_c = valid_c_orig[enclosed]
+                final_p = valid_cand_p[enclosed]
+                parent[final_c] = final_p
+                
+        valid = parent >= 0
+        valid_parents = parent[valid]
+        valid_weights = weights_ak[valid]
+        
+        if valid_parents.size > 0:
+            g = ak.GroupBy(valid_parents)
+            unique_parents, children_sum = g.aggregate(valid_weights, 'sum')
+            diff_arr = ak.zeros(K, dtype=ak.float64)
+            diff_arr[unique_parents] = children_sum
+            return ak.where(weights_ak - diff_arr > 0, weights_ak - diff_arr, 0.0)
+        else:
+            return weights_ak
+
+    @staticmethod
     def compute(
         metric: Optional[Metric],
         ranks: List['Rank'],
@@ -529,9 +591,41 @@ class AttributionEngine:
                 })
             return results
 
-        # ---- Arkouda backend: original pipeline ----
+        # ---- Arkouda backend: optimized pipeline ----
 
-        # 1. Global Timeline
+        # Arkouda fast path for independent concurrency
+        if get_backend() == 'arkouda' and concurrency_mode == 'independent':
+            results = {}
+            for r in ranks:
+                if metric is not None:
+                    inclusive = metric.get_delta_vectorized(r.starts, r.ends)
+                else:
+                    inclusive = r.ends - r.starts
+                
+                if strategy == 'exclusive':
+                    val = AttributionEngine._exclusive_ak(r.starts, r.ends, inclusive, r.depths)
+                else:
+                    val = inclusive
+                
+                if output_mode in ('rate', 'mean') and metric is not None:
+                    dur = r.ends - r.starts
+                    safe_dur = ak.where(dur == 0, 1.0, dur)
+                    val = ak.where(dur == 0, 0.0, val / safe_dur)
+                elif output_mode in ('min', 'max') and metric is not None:
+                    stats = metric.get_statistics_vectorized(r.starts, r.ends)
+                    if output_mode == 'min': val = stats['min']
+                    if output_mode == 'max': val = stats['max']
+                    
+                res_data = {
+                    'Start Time': r.starts, 'End Time': r.ends,
+                    'Duration': r.ends - r.starts,
+                    'Name': r.names, 'Depth': r.depths,
+                    'Value': val, 'Metadata': r.metadata
+                }
+                results[r.name] = ak.DataFrame(res_data)
+            return results
+
+        # 1. Global Timeline (Only for shared mode)
         time_arrays = []
         if metric is not None:
             time_arrays.append(metric.times)
@@ -585,39 +679,15 @@ class AttributionEngine:
             idx_end = ak.where(idx_end > max_idx, max_idx, idx_end)
             mask_valid = idx_end > idx_start
 
-            if strategy == 'exclusive':
-                # Arkouda backend — original depth-loop algorithm
-                unique_depths = ak.unique(r.depths)
-                unique_depths = ak.sort(unique_depths)
-                max_depth_per_interval = ak.zeros(breaks.size - 1, dtype=ak.int64) - 1
-                for d in unique_depths.to_ndarray():
-                    mask_d = r.depths == d
-                    cov = AttributionEngine._compute_coverage_ak(r.starts[mask_d], r.ends[mask_d], breaks)
-                    max_depth_per_interval = ak.where(cov > 0, d, max_depth_per_interval)
-                cum_resources_by_depth = {}
-                for d in unique_depths.to_ndarray():
-                    mask_max_d = max_depth_per_interval == int(d)
-                    res_d = ak.where(mask_max_d, per_rank_resource, 0.0)
-                    zeros = ak.zeros(1, dtype=ak.float64)
-                    cum_resources_by_depth[d] = ak.concatenate([zeros, ak.cumsum(res_d)])
-                attributed = ak.zeros(r.starts.size, dtype=ak.float64)
-                for d in unique_depths.to_ndarray():
-                    mask_calls_at_d = r.depths == d
-                    if not mask_calls_at_d.any(): continue
-                    s_idx = idx_start[mask_calls_at_d]
-                    e_idx = idx_end[mask_calls_at_d]
-                    c_res = cum_resources_by_depth[d]
-                    max_valid = c_res.size - 1
-                    e_idx = ak.where(e_idx > max_valid, max_valid, e_idx)
-                    s_idx = ak.where(s_idx > max_valid, max_valid, s_idx)
-                    vals = c_res[e_idx] - c_res[s_idx]
-                    attributed[mask_calls_at_d] = vals
+            zeros = ak.zeros(1, dtype=ak.float64)
+            cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
+            vals = cum_resource[idx_end] - cum_resource[idx_start]
+            inclusive_ak = ak.where(mask_valid, vals, 0.0)
 
+            if strategy == 'exclusive':
+                attributed = AttributionEngine._exclusive_ak(r.starts, r.ends, inclusive_ak, r.depths)
             else:
-                zeros = ak.zeros(1, dtype=ak.float64)
-                cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
-                vals = cum_resource[idx_end] - cum_resource[idx_start]
-                attributed = ak.where(mask_valid, vals, 0.0)
+                attributed = inclusive_ak
 
             final_values = attributed
 
