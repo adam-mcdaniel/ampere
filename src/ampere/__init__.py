@@ -592,104 +592,82 @@ class AttributionEngine:
             return results
 
         # ---- Arkouda backend: optimized pipeline ----
-
-        # Arkouda fast path for independent concurrency
-        if get_backend() == 'arkouda' and concurrency_mode == 'independent':
-            results = {}
-            for r in ranks:
-                if metric is not None:
-                    inclusive = metric.get_delta_vectorized(r.starts, r.ends)
-                else:
-                    inclusive = r.ends - r.starts
-                
-                if strategy == 'exclusive':
-                    val = AttributionEngine._exclusive_ak(r.starts, r.ends, inclusive, r.depths)
-                else:
-                    val = inclusive
-                
-                if output_mode in ('rate', 'mean') and metric is not None:
-                    dur = r.ends - r.starts
-                    safe_dur = ak.where(dur == 0, 1.0, dur)
-                    val = ak.where(dur == 0, 0.0, val / safe_dur)
-                elif output_mode in ('min', 'max') and metric is not None:
-                    stats = metric.get_statistics_vectorized(r.starts, r.ends)
-                    if output_mode == 'min': val = stats['min']
-                    if output_mode == 'max': val = stats['max']
-                    
-                res_data = {
-                    'Start Time': r.starts, 'End Time': r.ends,
-                    'Duration': r.ends - r.starts,
-                    'Name': r.names, 'Depth': r.depths,
-                    'Value': val, 'Metadata': r.metadata
-                }
-                results[r.name] = ak.DataFrame(res_data)
-            return results
-
-        # 1. Global Timeline (Only for shared mode)
-        time_arrays = []
+        
+        # 1. Create Event List for Sweep Algorithm
+        parts_times = []
+        parts_vals = []
         if metric is not None:
-            time_arrays.append(metric.times)
-
+            parts_times.append(metric.times)
+            parts_vals.append(ak.zeros(metric.times.size, dtype=ak.int64))
+            
         for r in ranks:
-            if metric is not None:
-                mask_overlap = (r.ends >= metric.t_min) & (r.starts <= metric.t_max)
-                try:
-                    if mask_overlap.any():
-                        time_arrays.append(r.starts[mask_overlap])
-                        time_arrays.append(r.ends[mask_overlap])
-                except Exception:
-                    time_arrays.append(r.starts)
-                    time_arrays.append(r.ends)
-            else:
-                time_arrays.append(r.starts)
-                time_arrays.append(r.ends)
-
-        merged = ak.concatenate(time_arrays)
-        breaks = ak.unique(merged)
-
+            # Flatten rank's intervals so nested functions don't overcount active_ranks
+            r_times = ak.concatenate([r.starts, r.ends])
+            r_vals = ak.concatenate([ak.ones(r.starts.size, dtype=ak.int64), ak.zeros(r.ends.size, dtype=ak.int64) - 1])
+            
+            r_order = ak.argsort(r_times)
+            r_times_sorted = r_times[r_order]
+            r_vals_sorted = r_vals[r_order]
+            
+            r_active = ak.cumsum(r_vals_sorted)
+            
+            mask_starts = (r_vals_sorted == 1) & (r_active == 1)
+            mask_ends = (r_vals_sorted == -1) & (r_active == 0)
+            
+            flat_starts = r_times_sorted[mask_starts]
+            flat_ends = r_times_sorted[mask_ends]
+            
+            parts_times.append(flat_starts)
+            parts_vals.append(ak.ones(flat_starts.size, dtype=ak.int64))
+            
+            parts_times.append(flat_ends)
+            parts_vals.append(ak.zeros(flat_ends.size, dtype=ak.int64) - 1)
+            
+        merged_times = ak.concatenate(parts_times)
+        merged_vals = ak.concatenate(parts_vals)
+        
+        # 2. Sort Events to Build Timeline
+        order = ak.argsort(merged_times)
+        breaks = merged_times[order]
+        vals_sorted = merged_vals[order]
+        
+        # 3. Active Counts via Cumsum
+        active_counts = ak.cumsum(vals_sorted)
+        
         if breaks.size < 2:
             return {r.name: ak.DataFrame(dict()) for r in ranks}
-
+            
+        # 4. Deltas
         if metric is not None:
             deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
         else:
             deltas = breaks[1:] - breaks[:-1]
-
-
-        rank_coverages = []
+            
+        # 5. Shared Scaling
         if concurrency_mode == 'shared':
-            active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
-            for r in ranks:
-                c = AttributionEngine._compute_coverage_ak(r.starts, r.ends, breaks)
-                rank_coverages.append(c)
-                active_counts += ak.where(c > 0, 1, 0)
-            scaling = ak.where(active_counts < 1, 1, active_counts)
+            scaling = ak.where(active_counts[:-1] < 1, 1, active_counts[:-1])
             per_rank_resource = deltas / scaling.astype(ak.float64)
         else:
             per_rank_resource = deltas
-
+            
+        # 6. Cumulative Resource
+        zeros = ak.zeros(1, dtype=ak.float64)
+        cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
+        
         results = {}
-        for i, r in enumerate(ranks):
-            l_idx = ak.searchsorted(breaks, r.starts, side='right') - 1
-            r_idx = ak.searchsorted(breaks, r.ends, side='left') - 1
-
-            idx_start = ak.where(l_idx < 0, 0, l_idx)
-            max_idx = breaks.size - 1
-            idx_end = r_idx + 1
-            idx_end = ak.where(idx_end > max_idx, max_idx, idx_end)
-            mask_valid = idx_end > idx_start
-
-            zeros = ak.zeros(1, dtype=ak.float64)
-            cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
-            vals = cum_resource[idx_end] - cum_resource[idx_start]
-            inclusive_ak = ak.where(mask_valid, vals, 0.0)
-
+        for r in ranks:
+            l_idx = ak.searchsorted(breaks, r.starts, side='left')
+            r_idx = ak.searchsorted(breaks, r.ends, side='left')
+            
+            inclusive_ak = cum_resource[r_idx] - cum_resource[l_idx]
+            
             if strategy == 'exclusive':
                 attributed = AttributionEngine._exclusive_ak(r.starts, r.ends, inclusive_ak, r.depths)
             else:
                 attributed = inclusive_ak
-
+                
             final_values = attributed
+
 
             if output_mode in ['rate', 'mean'] and metric is not None:
                 durations = r.ends - r.starts
