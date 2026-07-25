@@ -369,6 +369,12 @@ def _ones(size, dtype=np.float64):
     return _wrap(np.ones(size, dtype=dtype))
 
 
+def _full(size, fill_value, dtype=None):
+    if isinstance(fill_value, str):
+        return PandasStrings(np.full(size, fill_value, dtype=object))
+    return _wrap(np.full(size, fill_value, dtype=dtype))
+
+
 def _arange(size):
     return _wrap(np.arange(size))
 
@@ -431,6 +437,7 @@ class PandasBackend:
     cumsum = staticmethod(_cumsum)
     zeros = staticmethod(_zeros)
     ones = staticmethod(_ones)
+    full = staticmethod(_full)
     arange = staticmethod(_arange)
     array = staticmethod(_array)
     read_csv = staticmethod(_read_csv)

@@ -220,49 +220,72 @@ class AttributionEngine:
     Engine for attributing metric values to call graph ranks based on time and depth.
     """
     @staticmethod
-    def _compute_coverage_ak(starts: np.ndarray, ends: np.ndarray, breaks: np.ndarray) -> np.ndarray:
+    def _exclusive_ak(starts: np.ndarray, ends: np.ndarray, rank_ids: np.ndarray,
+                      depths: np.ndarray, inclusive: np.ndarray) -> np.ndarray:
         """
-        Computes the number of intervals covered by each segment [start, end] in the `breaks` timeline.
-        
-        The `breaks` array represents a global, sorted timeline of all unique start and end times 
-        from the metric and all ranks. It divides time into discrete, non-overlapping intervals.
-        For example, breaks=[0, 10, 20] defines intervals [0, 10) and [10, 20).
+        Flattened O(depth) exclusive attribution on the Arkouda backend, via the identity:
+            exclusive[k] = inclusive[k] - sum(inclusive[direct_children_of_k])
 
-        Args:
-            starts (np.ndarray): Start times of the segments.
-            ends (np.ndarray): End times of the segments.
-            breaks (np.ndarray): Global timeline of unique timestamps defining intervals.
+        Operates on all ranks at once (segments carry a `rank_ids` tag). The only
+        Python loop is over the *unique depth levels* — a small, bounded number
+        (call-stack depth), independent of the number of ranks or segments — and
+        every iteration is a single bulk server operation. This keeps the server
+        command count constant in ranks×segments so it stays parallel across locales.
 
-        Returns:
-            np.ndarray: An array where each element corresponds to an interval defined by `breaks` (size = breaks.size - 1).
-                        The value at index `i` is the count of segments that overlap with interval `i`.
+        Parent of segment k = the deepest shallower segment in the SAME rank that
+        starts at/before k and ends at/after it (well-nested call graph). Segments
+        with no enclosing parent (roots, or genuinely non-nested spans) are treated
+        as roots — matching the pandas oracle on well-nested Score-P traces.
         """
-        l_idx = ak.searchsorted(breaks, starts, side='right') - 1
-        r_idx = ak.searchsorted(breaks, ends, side='left')
-        l_idx = ak.where(l_idx < 0, 0, l_idx)
-        
-        valid = r_idx > l_idx
-        l_valid = l_idx[valid]
-        r_valid = r_idx[valid]
-        
-        if l_valid.size == 0:
-            return ak.zeros(breaks.size - 1, dtype=ak.int64)
+        K = starts.size
+        if K == 0:
+            return ak.zeros(0, dtype=ak.float64)
 
-        idxs = ak.concatenate([l_valid, r_valid])
-        ones = ak.ones(l_valid.size, dtype=ak.int64)
-        vals = ak.concatenate([ones, ones * -1])
-        
-        g = ak.GroupBy(idxs)
-        unique_idxs, summed_vals = g.aggregate(vals, 'sum')
-        
-        # Filter out OOB indices (e.g. ends beyond the timeline)
-        mask_valid = unique_idxs < breaks.size
-        unique_idxs = unique_idxs[mask_valid]
-        summed_vals = summed_vals[mask_valid]
-        
-        diff_arr = ak.zeros(breaks.size, dtype=ak.int64)
-        diff_arr[unique_idxs] += summed_vals
-        return ak.cumsum(diff_arr)[:-1]
+        # Per-segment ordering key = rank_id * K + (global start ordinal).
+        # rank_id dominates so ordering is (rank, start); integers keep it exact.
+        order = ak.argsort(starts)
+        sord = ak.zeros(K, dtype=ak.int64)
+        sord[order] = ak.arange(K)
+        pos_key = rank_ids * K + sord
+
+        all_idx = ak.arange(K)
+        parent = ak.zeros(K, dtype=ak.int64) - 1
+
+        unique_depths = ak.sort(ak.unique(depths)).to_ndarray().tolist()
+        for d in unique_depths:
+            child_mask = depths == d
+            pool_mask = depths < d
+            if not bool(pool_mask.any()) or not bool(child_mask.any()):
+                continue
+
+            pp_key = pos_key[pool_mask]
+            pp_orig = all_idx[pool_mask]
+            p_order = ak.argsort(pp_key)
+            pp_key_s = pp_key[p_order]
+            pp_orig_s = pp_orig[p_order]
+
+            c_idx = all_idx[child_mask]
+            c_key = pos_key[child_mask]
+
+            pos = ak.searchsorted(pp_key_s, c_key, side='right') - 1
+            valid = pos >= 0
+            pos_c = ak.where(valid, pos, 0)
+            cand = pp_orig_s[pos_c]
+
+            enclosed = valid & (rank_ids[cand] == rank_ids[c_idx]) & (ends[cand] >= ends[c_idx])
+            sel = c_idx[enclosed]
+            if sel.size > 0:
+                parent[sel] = cand[enclosed]
+
+        has_parent = parent >= 0
+        children_sum = ak.zeros(K, dtype=ak.float64)
+        if bool(has_parent.any()):
+            g = ak.GroupBy(parent[has_parent])
+            uk, sv = g.aggregate(inclusive[has_parent], 'sum')
+            children_sum[uk] = sv
+
+        excl = inclusive - children_sum
+        return ak.where(excl > 0, excl, 0.0)
 
     @staticmethod
     def _exclusive_pandas(starts_np: np.ndarray, ends_np: np.ndarray, weights: np.ndarray,
@@ -529,118 +552,115 @@ class AttributionEngine:
                 })
             return results
 
-        # ---- Arkouda backend: original pipeline ----
+        # ---- Arkouda backend: flattened, loop-free pipeline ----
+        # All ranks are concatenated into single flat arrays so every heavy
+        # operation below is ONE bulk server command instead of a per-rank /
+        # per-depth Python loop. This keeps the distributed command count
+        # constant in (ranks × depths), which is what lets the work scale out
+        # across locales instead of anti-scaling on the communication.
 
-        # 1. Global Timeline
-        time_arrays = []
-        if metric is not None:
-            time_arrays.append(metric.times)
-
-        for r in ranks:
-            if metric is not None:
-                mask_overlap = (r.ends >= metric.t_min) & (r.starts <= metric.t_max)
-                try:
-                    if mask_overlap.any():
-                        time_arrays.append(r.starts[mask_overlap])
-                        time_arrays.append(r.ends[mask_overlap])
-                except Exception:
-                    time_arrays.append(r.starts)
-                    time_arrays.append(r.ends)
-            else:
-                time_arrays.append(r.starts)
-                time_arrays.append(r.ends)
-
-        merged = ak.concatenate(time_arrays)
-        breaks = ak.unique(merged)
-
-        if breaks.size < 2:
+        sizes = [r.starts.size for r in ranks]
+        if sum(sizes) == 0:
             return {r.name: ak.DataFrame(dict()) for r in ranks}
 
+        S = ak.concatenate([r.starts for r in ranks])
+        E = ak.concatenate([r.ends   for r in ranks])
+        DEP = ak.concatenate([ak.cast(r.depths, ak.int64) for r in ranks])
+        RID = ak.concatenate([ak.full(sizes[i], i, dtype=ak.int64)
+                              for i in range(len(ranks))])
+        K = S.size
+
+        # 1. Global timeline (single unique/sort over all timestamps at once).
+        parts = ([metric.times] if metric is not None else []) + [S, E]
+        breaks = ak.unique(ak.concatenate(parts))
+        if breaks.size < 2:
+            return {r.name: ak.DataFrame(dict()) for r in ranks}
+        N = breaks.size - 1  # number of intervals
+
+        # 2. Metric delta per interval — evaluate cumulative energy at every break
+        #    at once. Clamp to the metric range so we match np.interp's flat
+        #    extrapolation (the pandas oracle), then diff and floor at 0.
         if metric is not None:
-            deltas = metric.get_delta_vectorized(breaks[:-1], breaks[1:])
+            bclamp = ak.where(breaks < metric.t_min, metric.t_min, breaks)
+            bclamp = ak.where(bclamp > metric.t_max, metric.t_max, bclamp)
+            e_at = ak_interp1d(metric.times, metric.cum_values, bclamp, kind='linear')
+            deltas = e_at[1:] - e_at[:-1]
+            deltas = ak.where(deltas > 0, deltas, 0.0)
         else:
             deltas = breaks[1:] - breaks[:-1]
 
+        # 3. Per-segment break indices (bulk searchsorted over all segments).
+        L = ak.searchsorted(breaks, S, side='right') - 1
+        L = ak.where(L < 0, 0, L)
+        L = ak.where(L > N, N, L)
+        R = ak.searchsorted(breaks, E, side='left')
+        R = ak.where(R > N, N, R)
 
-        rank_coverages = []
+        # 4. Active-rank count per interval (shared mode) with NO per-rank loop.
+        #    Zero-sum-block trick: each segment emits +1 at L and -1 at R inside
+        #    its own rank's block of length N+1. Every rank block is balanced, so
+        #    a single global cumsum yields per-rank coverage with no cross-block
+        #    bleed. Then one GroupBy over the interval position sums (cov>0)
+        #    across ranks. Materialises an (nranks × (N+1)) array — distributed,
+        #    the documented memory/scaling trade-off.
         if concurrency_mode == 'shared':
-            active_counts = ak.zeros(breaks.size - 1, dtype=ak.int64)
-            for r in ranks:
-                c = AttributionEngine._compute_coverage_ak(r.starts, r.ends, breaks)
-                rank_coverages.append(c)
-                active_counts += ak.where(c > 0, 1, 0)
-            scaling = ak.where(active_counts < 1, 1, active_counts)
-            per_rank_resource = deltas / scaling.astype(ak.float64)
+            nblock = N + 1
+            keys = ak.concatenate([RID * nblock + L, RID * nblock + R])
+            vals = ak.concatenate([ak.ones(K, dtype=ak.int64),
+                                   ak.full(K, -1, dtype=ak.int64)])
+            g = ak.GroupBy(keys)
+            uk, sv = g.aggregate(vals, 'sum')
+            diff = ak.zeros(len(ranks) * nblock, dtype=ak.int64)
+            diff[uk] = sv
+            cov_flat = ak.cumsum(diff)
+            posn = ak.arange(len(ranks) * nblock) % nblock
+            keep = posn < N
+            g2 = ak.GroupBy(posn[keep])
+            uk2, cnt = g2.aggregate(ak.where(cov_flat[keep] > 0, 1, 0), 'sum')
+            active_counts = ak.zeros(N, dtype=ak.int64)
+            active_counts[uk2] = cnt
+            scaling = ak.where(active_counts < 1, 1, active_counts).astype(ak.float64)
+            per_rank_resource = deltas / scaling
         else:
             per_rank_resource = deltas
 
+        # 5. Inclusive attribution for every segment at once via a prefix sum.
+        cum = ak.concatenate([ak.zeros(1, dtype=ak.float64),
+                              ak.cumsum(per_rank_resource)])
+        inclusive = cum[R] - cum[L]
+        inclusive = ak.where(R <= L, 0.0, inclusive)
+
+        # 6. Exclusive: subtract direct-children cost via the parent identity.
+        if strategy == 'exclusive':
+            val = AttributionEngine._exclusive_ak(S, E, RID, DEP, inclusive)
+        else:
+            val = inclusive
+
+        # 7. Output mode transforms (all vectorised over the flat arrays).
+        if output_mode in ('rate', 'mean') and metric is not None:
+            dur = E - S
+            safe_dur = ak.where(dur == 0, 1.0, dur)
+            val = ak.where(dur == 0, 0.0, val / safe_dur)
+        elif output_mode in ('min', 'max') and metric is not None:
+            stats = metric.get_statistics_vectorized(S, E)
+            val = stats[output_mode]
+
+        # 8. Slice the flat results back into the per-rank dict contract.
+        #    Contiguous slices only (bulk copies) — no distributed reductions.
         results = {}
+        off = 0
         for i, r in enumerate(ranks):
-            l_idx = ak.searchsorted(breaks, r.starts, side='right') - 1
-            r_idx = ak.searchsorted(breaks, r.ends, side='left') - 1
-
-            idx_start = ak.where(l_idx < 0, 0, l_idx)
-            max_idx = breaks.size - 1
-            idx_end = r_idx + 1
-            idx_end = ak.where(idx_end > max_idx, max_idx, idx_end)
-            mask_valid = idx_end > idx_start
-
-            if strategy == 'exclusive':
-                # Arkouda backend — original depth-loop algorithm
-                unique_depths = ak.unique(r.depths)
-                unique_depths = ak.sort(unique_depths)
-                max_depth_per_interval = ak.zeros(breaks.size - 1, dtype=ak.int64) - 1
-                for d in unique_depths.to_ndarray():
-                    mask_d = r.depths == d
-                    cov = AttributionEngine._compute_coverage_ak(r.starts[mask_d], r.ends[mask_d], breaks)
-                    max_depth_per_interval = ak.where(cov > 0, d, max_depth_per_interval)
-                cum_resources_by_depth = {}
-                for d in unique_depths.to_ndarray():
-                    mask_max_d = max_depth_per_interval == int(d)
-                    res_d = ak.where(mask_max_d, per_rank_resource, 0.0)
-                    zeros = ak.zeros(1, dtype=ak.float64)
-                    cum_resources_by_depth[d] = ak.concatenate([zeros, ak.cumsum(res_d)])
-                attributed = ak.zeros(r.starts.size, dtype=ak.float64)
-                for d in unique_depths.to_ndarray():
-                    mask_calls_at_d = r.depths == d
-                    if not mask_calls_at_d.any(): continue
-                    s_idx = idx_start[mask_calls_at_d]
-                    e_idx = idx_end[mask_calls_at_d]
-                    c_res = cum_resources_by_depth[d]
-                    max_valid = c_res.size - 1
-                    e_idx = ak.where(e_idx > max_valid, max_valid, e_idx)
-                    s_idx = ak.where(s_idx > max_valid, max_valid, s_idx)
-                    vals = c_res[e_idx] - c_res[s_idx]
-                    attributed[mask_calls_at_d] = vals
-
-            else:
-                zeros = ak.zeros(1, dtype=ak.float64)
-                cum_resource = ak.concatenate([zeros, ak.cumsum(per_rank_resource)])
-                vals = cum_resource[idx_end] - cum_resource[idx_start]
-                attributed = ak.where(mask_valid, vals, 0.0)
-
-            final_values = attributed
-
-            if output_mode in ['rate', 'mean'] and metric is not None:
-                durations = r.ends - r.starts
-                safe_dur = ak.where(durations == 0, 1.0, durations)
-                final_values = attributed / safe_dur
-                final_values = ak.where(durations == 0, 0.0, final_values)
-            elif output_mode in ['min', 'max'] and metric is not None:
-                stats = metric.get_statistics_vectorized(r.starts, r.ends)
-                if output_mode == 'min': final_values = stats['min']
-                if output_mode == 'max': final_values = stats['max']
-
-            res_data = {
+            sz = sizes[i]
+            results[r.name] = ak.DataFrame({
                 'Start Time': r.starts,
-                'End Time': r.ends,
-                'Duration': r.ends - r.starts,
-                'Name': r.names,
-                'Depth': r.depths,
-                'Value': final_values,
-                'Metadata': r.metadata
-            }
-            results[r.name] = ak.DataFrame(res_data)
+                'End Time':   r.ends,
+                'Duration':   r.ends - r.starts,
+                'Name':       r.names,
+                'Depth':      r.depths,
+                'Value':      val[off:off + sz],
+                'Metadata':   r.metadata,
+            })
+            off += sz
 
         return results
 
