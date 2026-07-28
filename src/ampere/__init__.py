@@ -886,8 +886,74 @@ class Run:
         return ak.DataFrame(combined)
 
 # ==========================================
-# 4. Infrastructure
+# 4. Infrastructure & OTF2 Reader Helpers
 # ==========================================
+
+class _Otf2Interval(NamedTuple):
+    start: float
+    end: Optional[float] = None
+    depth: float = 0
+    name: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+    def is_active(self, time: float) -> bool:
+        return self.start <= time and (self.end is None or time < self.end)
+
+    def has_overlap(self, other: '_Otf2Interval') -> bool:
+        my_start = self.start
+        my_end = self.end if self.end is not None else float('inf')
+        other_start = other.start
+        other_end = other.end if other.end is not None else float('inf')
+        return my_start < other_end and other_start < my_end
+
+    def clip(self, start: float, end: float) -> '_Otf2Interval':
+        if not self.has_overlap(_Otf2Interval(start, end)):
+            raise ValueError("The provided start and end times do not overlap with the interval.")
+        new_start = max(self.start, start)
+        new_end = min(self.end, end) if self.end is not None else end
+        if new_end is not None and new_start > new_end:
+            raise ValueError(f"Clipped interval has no valid duration ({new_start} > {new_end}).")
+        return self._replace(start=new_start, end=new_end)
+
+class _Otf2Timeline:
+    def __init__(self):
+        self.finished_intervals: List[_Otf2Interval] = []
+        self.live_intervals: List[_Otf2Interval] = []
+
+    def enter(self, start: float, **kwargs):
+        if 'end' in kwargs:
+            raise ValueError("Cannot specify 'end' when entering a new interval.")
+        interval = _Otf2Interval(**kwargs, start=start, depth=len(self.live_intervals) + 1, metadata=kwargs.get('metadata', {}))
+        self.live_intervals.append(interval)
+        return interval
+
+    def leave(self, end: float) -> None:
+        if not self.live_intervals:
+            return
+        interval = self.live_intervals.pop()
+        updated_interval = interval._replace(end=end)
+        self.finished_intervals.append(updated_interval)
+
+    def add_parameter(self, name: str, value: Any) -> None:
+        if not self.live_intervals:
+            return
+        interval = self.live_intervals[-1]
+        updated_metadata = dict(interval.metadata) if interval.metadata is not None else {}
+        updated_metadata[name] = value
+        self.live_intervals[-1] = interval._replace(metadata=updated_metadata)
+
+    def get_intervals_between(self, start: float, end: float) -> List[_Otf2Interval]:
+        if start > end:
+            raise ValueError("Start time must be less than or equal to end time.")
+        overlapping = filter(
+            lambda iv: iv.has_overlap(_Otf2Interval(start, end)),
+            self.finished_intervals + self.live_intervals
+        )
+        clipped = map(lambda iv: iv.clip(start, end), overlapping)
+        return sorted(clipped, key=lambda x: (x.start, x.end if x.end is not None else float('inf')))
+
+class _Otf2CallGraph(_Otf2Timeline):
+    pass
 
 def _resolve_config(name: str, config_map: Dict) -> MetricConfig:
     if name in config_map: return config_map[name]
