@@ -399,6 +399,37 @@ def _read_csv(path, column_delim=','):
     return AmpereDataFrame(data)
 
 
+def _read_parquet(path, **kwargs):
+    """Pandas-backend counterpart to arkouda.read_parquet.
+
+    Reads one Parquet file (or a list of files, concatenated) via pandas/pyarrow and
+    returns an AmpereDataFrame whose columns are _PdArray / PandasStrings, matching the
+    dict-like interface (`in`, `[]`) that Ensemble.from_trace_paths_parquet expects.
+    """
+    paths = path if isinstance(path, (list, tuple)) else [path]
+    df = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+    data = {}
+    for col in df.columns:
+        series = df[col]
+        if series.dtype == object:
+            data[col] = PandasStrings(series.values.astype(str))
+        else:
+            data[col] = _wrap(series.values)
+    return AmpereDataFrame(data)
+
+
+def _full(size, fill_value, dtype=None):
+    """Pandas-backend counterpart to arkouda.full: a length-`size` array of `fill_value`.
+
+    A string fill returns PandasStrings (so it survives the string-aware code paths);
+    anything else returns a numeric _PdArray.
+    """
+    size = int(size)
+    if isinstance(fill_value, str) or dtype is str:
+        return PandasStrings(np.array([fill_value] * size, dtype=str))
+    return _wrap(np.full(size, fill_value, dtype=dtype))
+
+
 # ---------------------------------------------------------------------------
 # PandasBackend — the namespace object returned by _backend.py
 # ---------------------------------------------------------------------------
@@ -434,6 +465,8 @@ class PandasBackend:
     arange = staticmethod(_arange)
     array = staticmethod(_array)
     read_csv = staticmethod(_read_csv)
+    read_parquet = staticmethod(_read_parquet)
+    full = staticmethod(_full)
 
     @staticmethod
     def connect(*args, **kwargs):
