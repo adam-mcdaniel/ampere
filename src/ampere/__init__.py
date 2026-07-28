@@ -5,7 +5,8 @@ import re
 import csv
 import concurrent.futures
 from enum import Enum
-from typing import Dict, List, Tuple, Optional, Union, Any, Literal, Callable, Pattern
+import threading
+from typing import Dict, List, Tuple, Optional, Union, Any, Literal, Callable, Pattern, NamedTuple
 from collections import defaultdict
 from tqdm import tqdm
 from dataclasses import dataclass
@@ -958,6 +959,160 @@ class Ensemble:
             if isinstance(k, str) and k.startswith('^') and re.match(k, name): return v
         return MetricConfig(kind=MetricType.INSTANTANEOUS)
 
+
+    @staticmethod
+    def from_otf2(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}, max_workers: int = 32) -> 'Ensemble':
+        """
+        Loads OTF2 trace files directly into memory and constructs an Ensemble object.
+
+        Args:
+            trace_paths (List[str]): List of file paths to OTF2 trace files or directories (e.g. '/path/to/trace_dir' or 'traces.otf2').
+            node_ranks (Dict): Dictionary mapping Node names to lists of Rank IDs (e.g., {"Node0": ["MPI Rank 0", "MPI Rank 1"]}).
+            metric_configs (Dict): Dictionary mapping metric naming patterns to `MetricConfig` objects.
+            max_workers (int): Maximum number of worker threads for parallel OTF2 reading.
+
+        Returns:
+            Ensemble: An Ensemble object containing the loaded Runs.
+        """
+        import otf2
+
+        _otf2_matches_lock = threading.Lock()
+        _otf2_matches = {}
+
+        def _process_location(location, trace_path, start_time, timer_resolution):
+            call_graph = _Otf2CallGraph()
+            nonlocal _otf2_matches
+            with otf2.reader.open(trace_path) as reader:
+                if location not in reader.definitions.locations:
+                    return None
+                locs = [l for l in reader.definitions.locations if l.name == location.name and l.group.name == location.group.name]
+                if len(locs) > 1:
+                    with _otf2_matches_lock:
+                        key = (location.group.name, location.name)
+                        idx = _otf2_matches.get(key, 0)
+                        _otf2_matches[key] = idx + 1
+                        locs = [locs[idx % len(locs)]]
+
+                local_metrics = {}
+                def ts_to_sec(ts):
+                    if ts is None or start_time is None or timer_resolution is None:
+                        return 0.0
+                    return (ts - start_time) / timer_resolution
+
+                for _, event in reader.events(locs):
+                    current_time = ts_to_sec(event.time)
+                    if isinstance(event, otf2.events.Metric):
+                        m_name = event.member.name
+                        if m_name not in local_metrics:
+                            local_metrics[m_name] = []
+                        if len(local_metrics[m_name]) == 0 or local_metrics[m_name][-1][1] != event.value:
+                            local_metrics[m_name].append((current_time, event.value))
+                    elif isinstance(event, otf2.events.ParameterInt):
+                        call_graph.add_parameter(event.parameter.name, event.value)
+                    elif isinstance(event, otf2.events.Enter):
+                        call_graph.enter(current_time, name=event.region.name)
+                    elif isinstance(event, otf2.events.Leave):
+                        try:
+                            call_graph.leave(current_time)
+                        except Exception:
+                            continue
+            return (location.group.name, location.name, call_graph, local_metrics)
+
+        runs = []
+        for path in tqdm(trace_paths, desc="Loading OTF2 Runs"):
+            abs_path = os.path.abspath(path)
+            otf2_file = abs_path
+            if os.path.isdir(abs_path):
+                if os.path.exists(os.path.join(abs_path, "traces.otf2")):
+                    otf2_file = os.path.join(abs_path, "traces.otf2")
+                elif os.path.exists(os.path.join(abs_path, "traces", "traces.otf2")):
+                    otf2_file = os.path.join(abs_path, "traces", "traces.otf2")
+
+            call_graphs = defaultdict(dict)
+            metrics_data = defaultdict(lambda: defaultdict(list))
+            start_time = None
+            timer_resolution = None
+
+            with otf2.reader.open(otf2_file) as reader:
+                timer_resolution = reader.timer_resolution
+                for _, event in reader.events:
+                    if isinstance(event, otf2.events.ProgramBegin):
+                        start_time = event.time
+                        break
+                locations = sorted(list(reader.definitions.locations), key=lambda loc: (loc.group.name, loc.name))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_process_location, loc, otf2_file, start_time, timer_resolution)
+                    for loc in locations
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    res = future.result()
+                    if res is None: continue
+                    group, thread, cg, l_metrics = res
+                    call_graphs[group][thread] = cg
+                    for m_name, vals in l_metrics.items():
+                        metrics_data[group][m_name].extend(vals)
+
+            nodes = []
+            for node_name, ranks in node_ranks.items():
+                node_metrics = []
+                for r_id in ranks:
+                    if r_id in metrics_data:
+                        for m_name, vals in metrics_data[r_id].items():
+                            if not vals: continue
+                            times_ak = ak.cast(ak.array([v[0] for v in vals]), ak.float64)
+                            vals_ak = ak.cast(ak.array([v[1] for v in vals]), ak.float64)
+                            cfg = Ensemble._resolve_config(m_name, metric_configs)
+                            node_metrics.append(Metric(m_name, times_ak, vals_ak, cfg))
+                        break
+
+                loaded_ranks = []
+                for r_id in ranks:
+                    matched_cg = None
+                    group_val = r_id
+                    for grp, threads in call_graphs.items():
+                        if grp == r_id:
+                            for th_name, cg in threads.items():
+                                matched_cg = cg
+                                break
+                            if matched_cg: break
+
+                    if matched_cg is None:
+                        for grp, threads in call_graphs.items():
+                            for th_name, cg in threads.items():
+                                if r_id in grp or r_id in th_name:
+                                    matched_cg = cg
+                                    group_val = grp
+                                    break
+                            if matched_cg: break
+
+                    if matched_cg is None:
+                        continue
+
+                    intervals = matched_cg.get_intervals_between(float('-inf'), float('inf'))
+                    if not intervals:
+                        continue
+
+                    c_dict = {
+                        'Group': ak.array([group_val] * len(intervals)),
+                        'Depth': ak.cast(ak.array([int(iv.depth) for iv in intervals]), ak.int64),
+                        'Name': ak.array([iv.name if iv.name else "Unknown" for iv in intervals]),
+                        'Start Time': ak.cast(ak.array([float(iv.start) for iv in intervals]), ak.float64),
+                        'End Time': ak.cast(ak.array([float(iv.end if iv.end is not None else float('inf')) for iv in intervals]), ak.float64),
+                        'Duration': ak.cast(ak.array([float((iv.end or float('inf')) - iv.start) for iv in intervals]), ak.float64),
+                        'Metadata': ak.array([str(iv.metadata) if iv.metadata else "" for iv in intervals])
+                    }
+                    c_df = ak.DataFrame(c_dict)
+                    mask = c_df['End Time'] > c_df['Start Time']
+                    c_df = Ensemble._apply_filter_to_dict(c_df, mask)
+                    loaded_ranks.append(Rank(node_name, r_id, c_df))
+
+                if loaded_ranks:
+                    nodes.append(Node(node_name, node_metrics, loaded_ranks))
+            if nodes:
+                runs.append(Run(abs_path, nodes))
+        return Ensemble(runs)
 
     @staticmethod
     def from_trace_paths_parquet(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}) -> 'Ensemble':
