@@ -1029,60 +1029,18 @@ class Ensemble:
     @staticmethod
     def from_otf2(trace_paths: List[str], node_ranks: Dict, metric_configs: Dict = {}, max_workers: int = 32) -> 'Ensemble':
         """
-        Loads OTF2 trace files directly into memory and constructs an Ensemble object.
+        Loads OTF2 trace files directly into memory and constructs an Ensemble object using single-pass streaming.
 
         Args:
             trace_paths (List[str]): List of file paths to OTF2 trace files or directories (e.g. '/path/to/trace_dir' or 'traces.otf2').
             node_ranks (Dict): Dictionary mapping Node names to lists of Rank IDs (e.g., {"Node0": ["MPI Rank 0", "MPI Rank 1"]}).
             metric_configs (Dict): Dictionary mapping metric naming patterns to `MetricConfig` objects.
-            max_workers (int): Maximum number of worker threads for parallel OTF2 reading.
+            max_workers (int): Unused, kept for backwards compatibility.
 
         Returns:
             Ensemble: An Ensemble object containing the loaded Runs.
         """
         import otf2
-
-        _otf2_matches_lock = threading.Lock()
-        _otf2_matches = {}
-
-        def _process_location(location, trace_path, start_time, timer_resolution):
-            call_graph = _Otf2CallGraph()
-            nonlocal _otf2_matches
-            with otf2.reader.open(trace_path) as reader:
-                if location not in reader.definitions.locations:
-                    return None
-                locs = [l for l in reader.definitions.locations if l.name == location.name and l.group.name == location.group.name]
-                if len(locs) > 1:
-                    with _otf2_matches_lock:
-                        key = (location.group.name, location.name)
-                        idx = _otf2_matches.get(key, 0)
-                        _otf2_matches[key] = idx + 1
-                        locs = [locs[idx % len(locs)]]
-
-                local_metrics = {}
-                def ts_to_sec(ts):
-                    if ts is None or start_time is None or timer_resolution is None:
-                        return 0.0
-                    return (ts - start_time) / timer_resolution
-
-                for _, event in reader.events(locs):
-                    current_time = ts_to_sec(event.time)
-                    if isinstance(event, otf2.events.Metric):
-                        m_name = event.member.name
-                        if m_name not in local_metrics:
-                            local_metrics[m_name] = []
-                        if len(local_metrics[m_name]) == 0 or local_metrics[m_name][-1][1] != event.value:
-                            local_metrics[m_name].append((current_time, event.value))
-                    elif isinstance(event, otf2.events.ParameterInt):
-                        call_graph.add_parameter(event.parameter.name, event.value)
-                    elif isinstance(event, otf2.events.Enter):
-                        call_graph.enter(current_time, name=event.region.name)
-                    elif isinstance(event, otf2.events.Leave):
-                        try:
-                            call_graph.leave(current_time)
-                        except Exception:
-                            continue
-            return (location.group.name, location.name, call_graph, local_metrics)
 
         runs = []
         for path in tqdm(trace_paths, desc="Loading OTF2 Runs"):
@@ -1094,41 +1052,72 @@ class Ensemble:
                 elif os.path.exists(os.path.join(abs_path, "traces", "traces.otf2")):
                     otf2_file = os.path.join(abs_path, "traces", "traces.otf2")
 
-            call_graphs = defaultdict(dict)
-            metrics_data = defaultdict(lambda: defaultdict(list))
-            start_time = None
-            timer_resolution = None
+            stacks = {}
+            callgraphs_data = defaultdict(lambda: defaultdict(lambda: {
+                'Group': [], 'Depth': [], 'Name': [], 'Start Time': [], 'End Time': [], 'Duration': [], 'Metadata': []
+            }))
+            metrics_data = defaultdict(lambda: defaultdict(lambda: {'times': [], 'vals': []}))
+            last_metric = {}
 
-            with otf2.reader.open(otf2_file) as reader:
-                timer_resolution = reader.timer_resolution
-                for _, event in reader.events:
-                    if isinstance(event, otf2.events.ProgramBegin):
-                        start_time = event.time
-                        break
-                locations = sorted(list(reader.definitions.locations), key=lambda loc: (loc.group.name, loc.name))
+            with otf2.reader.open(otf2_file) as trace:
+                clock = trace.definitions.clock_properties
+                resolution = float(clock.timer_resolution)
+                offset = clock.global_offset
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(_process_location, loc, otf2_file, start_time, timer_resolution)
-                    for loc in locations
-                ]
-                for future in concurrent.futures.as_completed(futures):
-                    res = future.result()
-                    if res is None: continue
-                    group, thread, cg, l_metrics = res
-                    call_graphs[group][thread] = cg
-                    for m_name, vals in l_metrics.items():
-                        metrics_data[group][m_name].extend(vals)
+                def to_seconds(ticks):
+                    return (ticks - offset) / resolution if resolution else 0.0
+
+                for location, event in trace.events:
+                    loc_id = location._ref if hasattr(location, '_ref') else id(location)
+                    thread = location.name.replace(' ', '_')
+                    group = location.group.name if getattr(location, 'group', None) else 'Unknown'
+
+                    if isinstance(event, otf2.events.Enter):
+                        stk = stacks.setdefault(loc_id, [])
+                        stk.append((event.time, event.region.name, len(stk)))
+
+                    elif isinstance(event, otf2.events.Leave):
+                        stk = stacks.get(loc_id)
+                        if not stk:
+                            continue
+                        start_ticks, region_name, depth = stk.pop()
+                        s = to_seconds(start_ticks)
+                        e = to_seconds(event.time)
+                        if e <= s:
+                            continue
+                        cg = callgraphs_data[group][thread]
+                        cg['Group'].append(group)
+                        cg['Depth'].append(depth + 1)
+                        cg['Name'].append(region_name)
+                        cg['Start Time'].append(s)
+                        cg['End Time'].append(e)
+                        cg['Duration'].append(e - s)
+                        cg['Metadata'].append('')
+
+                    elif isinstance(event, otf2.events.Metric):
+                        member = getattr(event, 'member', None)
+                        if member is None:
+                            continue
+                        m_name = member.name
+                        val = event.value
+                        dk = (group, m_name)
+                        if last_metric.get(dk) == val:
+                            continue
+                        last_metric[dk] = val
+                        t = to_seconds(event.time)
+                        metrics_data[group][m_name]['times'].append(t)
+                        metrics_data[group][m_name]['vals'].append(val)
 
             nodes = []
             for node_name, ranks in node_ranks.items():
                 node_metrics = []
                 for r_id in ranks:
                     if r_id in metrics_data:
-                        for m_name, vals in metrics_data[r_id].items():
-                            if not vals: continue
-                            times_ak = ak.cast(ak.array([v[0] for v in vals]), ak.float64)
-                            vals_ak = ak.cast(ak.array([v[1] for v in vals]), ak.float64)
+                        for m_name, m_dict in metrics_data[r_id].items():
+                            if not m_dict['times']:
+                                continue
+                            times_ak = ak.cast(ak.array(m_dict['times']), ak.float64)
+                            vals_ak = ak.cast(ak.array(m_dict['vals']), ak.float64)
                             cfg = Ensemble._resolve_config(m_name, metric_configs)
                             node_metrics.append(Metric(m_name, times_ak, vals_ak, cfg))
                         break
@@ -1137,41 +1126,36 @@ class Ensemble:
                 for r_id in ranks:
                     matched_cg = None
                     group_val = r_id
-                    for grp, threads in call_graphs.items():
+                    for grp, threads in callgraphs_data.items():
                         if grp == r_id:
-                            for th_name, cg in threads.items():
-                                matched_cg = cg
-                                break
-                            if matched_cg: break
-
-                    if matched_cg is None:
-                        for grp, threads in call_graphs.items():
-                            for th_name, cg in threads.items():
-                                if r_id in grp or r_id in th_name:
-                                    matched_cg = cg
-                                    group_val = grp
+                            for th_name, cg_dict in threads.items():
+                                if cg_dict['Start Time']:
+                                    matched_cg = cg_dict
                                     break
                             if matched_cg: break
 
                     if matched_cg is None:
-                        continue
+                        for grp, threads in callgraphs_data.items():
+                            for th_name, cg_dict in threads.items():
+                                if (r_id in grp or r_id in th_name) and cg_dict['Start Time']:
+                                    matched_cg = cg_dict
+                                    group_val = grp
+                                    break
+                            if matched_cg: break
 
-                    intervals = matched_cg.get_intervals_between(float('-inf'), float('inf'))
-                    if not intervals:
+                    if matched_cg is None or len(matched_cg['Start Time']) == 0:
                         continue
 
                     c_dict = {
-                        'Group': ak.array([group_val] * len(intervals)),
-                        'Depth': ak.cast(ak.array([int(iv.depth) for iv in intervals]), ak.int64),
-                        'Name': ak.array([iv.name if iv.name else "Unknown" for iv in intervals]),
-                        'Start Time': ak.cast(ak.array([float(iv.start) for iv in intervals]), ak.float64),
-                        'End Time': ak.cast(ak.array([float(iv.end if iv.end is not None else float('inf')) for iv in intervals]), ak.float64),
-                        'Duration': ak.cast(ak.array([float((iv.end or float('inf')) - iv.start) for iv in intervals]), ak.float64),
-                        'Metadata': ak.array([str(iv.metadata) if iv.metadata else "" for iv in intervals])
+                        'Group': ak.array(matched_cg['Group']),
+                        'Depth': ak.cast(ak.array(matched_cg['Depth']), ak.int64),
+                        'Name': ak.array(matched_cg['Name']),
+                        'Start Time': ak.cast(ak.array(matched_cg['Start Time']), ak.float64),
+                        'End Time': ak.cast(ak.array(matched_cg['End Time']), ak.float64),
+                        'Duration': ak.cast(ak.array(matched_cg['Duration']), ak.float64),
+                        'Metadata': ak.array(matched_cg['Metadata'])
                     }
                     c_df = ak.DataFrame(c_dict)
-                    mask = c_df['End Time'] > c_df['Start Time']
-                    c_df = Ensemble._apply_filter_to_dict(c_df, mask)
                     loaded_ranks.append(Rank(node_name, r_id, c_df))
 
                 if loaded_ranks:

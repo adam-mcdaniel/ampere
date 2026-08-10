@@ -405,6 +405,18 @@ def _read_csv(path, column_delim=','):
     return AmpereDataFrame(data)
 
 
+def _read_parquet(path):
+    df = pd.read_parquet(path)
+    data = {}
+    for col in df.columns:
+        series = df[col]
+        if series.dtype == object or series.dtype.kind in ('U', 'S'):
+            data[col] = PandasStrings(series.values.astype(str))
+        else:
+            data[col] = _wrap(series.values)
+    return AmpereDataFrame(data)
+
+
 # ---------------------------------------------------------------------------
 # PandasBackend — the namespace object returned by _backend.py
 # ---------------------------------------------------------------------------
@@ -441,6 +453,7 @@ class PandasBackend:
     arange = staticmethod(_arange)
     array = staticmethod(_array)
     read_csv = staticmethod(_read_csv)
+    read_parquet = staticmethod(_read_parquet)
 
     @staticmethod
     def connect(*args, **kwargs):
